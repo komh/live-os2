@@ -1,17 +1,17 @@
-COMPILE_OPTS =         $(INCLUDES) -I. -O -DSOCKLEN_T=int -DXLOCALE_NOT_USED -DUSE_GETHOSTBYNAME=1 -DRTSPCLIENT_SYNCHRONOUS_INTERFACE
+COMPILE_OPTS =         $(INCLUDES) -I. -O -DSOCKLEN_T=socklen_t -DXLOCALE_NOT_USED -DUSE_GETHOSTBYNAME=1 -DRTSPCLIENT_SYNCHRONOUS_INTERFACE -DNO_GETIFADDRS
 C =                    c
 C_COMPILER =           $(CC)
-C_FLAGS =              $(COMPILE_OPTS) 
+C_FLAGS =              $(COMPILE_OPTS)
 CPP =                  cpp
 CPLUSPLUS_COMPILER =   $(CXX)
-CPLUSPLUS_FLAGS =      $(COMPILE_OPTS) -Wall -Wno-deprecated 
+CPLUSPLUS_FLAGS =      $(COMPILE_OPTS) -std=c++20 -Wall -Wno-deprecated
 OBJ =                  o
-LINK =                 $(CXX) -o 
+LINK =                 $(CXX) -o
 LINK_OPTS =            -L.
 CONSOLE_LINK_OPTS =    $(LINK_OPTS)
-LIBRARY_LINK =         ar cr 
-LIBRARY_LINK_OPTS =    
+LIBRARY_LINK =         $(AR) cr # do not remove trailling space
+LIBRARY_LINK_OPTS =
 LIB_SUFFIX =                   a
-LIBS_FOR_CONSOLE_APPLICATION = 
-LIBS_FOR_GUI_APPLICATION = 
+LIBS_FOR_CONSOLE_APPLICATION = -lssl -lcrypto
+LIBS_FOR_GUI_APPLICATION =
 EXE = .exe
