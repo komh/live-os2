@@ -119,6 +119,45 @@ typedef unsigned char u_int8_t;
 #endif
 #endif
 
+#ifdef __OS2__
+
+/* IPv6 stuffs */
+struct live_in6_addr {
+    unsigned char   s6_addr[16];   /* IPv6 address */
+};
+#define in6_addr live_in6_addr
+
+struct live_sockaddr_in6 {
+    sa_family_t     sin6_family;   /* AF_INET6 */
+    in_port_t       sin6_port;     /* port number */
+    uint32_t        sin6_flowinfo; /* IPv6 flow information */
+    struct in6_addr sin6_addr;     /* IPv6 address */
+    uint32_t        sin6_scope_id; /* Scope ID (new in Linux 2.4) */
+};
+#define sockaddr_in6 live_sockaddr_in6
+
+struct live_ipv6_mreq {
+    /* IPv6 multicast address of group */
+    struct in6_addr ipv6mr_multiaddr;
+
+    /* local interface */
+    unsigned int ipv6mr_interface;
+};
+#define ipv6_mreq live_ipv6_mreq
+
+#define IN6ADDR_ANY_INIT {{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}}
+
+#define IPPROTO_IPV6 41
+
+#define INET6_ADDRSTRLEN 46
+
+#define IPV6_MULTICAST_IF 17
+#define IPV6_JOIN_GROUP 20
+#define IPV6_LEAVE_GROUP 21
+#define IPV6_V6ONLY 26
+#define IPV6_MULTICAST_LOOP 34
+#endif
+
 #ifndef SOCKLEN_T
 #define SOCKLEN_T int
 #endif
