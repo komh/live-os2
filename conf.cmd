@@ -1,0 +1,1 @@
+@sh ./genMakefiles os2
