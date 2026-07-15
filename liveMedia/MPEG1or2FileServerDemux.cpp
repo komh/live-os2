@@ -1,7 +1,7 @@
 /**********
 This library is free software; you can redistribute it and/or modify it under
 the terms of the GNU Lesser General Public License as published by the
-Free Software Foundation; either version 2.1 of the License, or (at your
+Free Software Foundation; either version 3 of the License, or (at your
 option) any later version. (See <http://www.gnu.org/copyleft/lesser.html>.)
 
 This library is distributed in the hope that it will be useful, but WITHOUT
@@ -14,7 +14,7 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 **********/
 // "liveMedia"
-// Copyright (c) 1996-2012 Live Networks, Inc.  All rights reserved.
+// Copyright (c) 1996-2026 Live Networks, Inc.  All rights reserved.
 // A server demultiplexer for a MPEG 1 or 2 Program Stream
 // Implementation
 
@@ -67,7 +67,8 @@ MPEG1or2FileServerDemux::newAC3AudioServerMediaSubsession() {
 MPEG1or2DemuxedElementaryStream*
 MPEG1or2FileServerDemux::newElementaryStream(unsigned clientSessionId,
 					     u_int8_t streamIdTag) {
-  MPEG1or2Demux* demuxToUse;
+  MPEG1or2Demux* demuxToUse = NULL;
+
   if (clientSessionId == 0) {
     // 'Session 0' is treated especially, because its audio & video streams
     // are created and destroyed one-at-a-time, rather than both streams being
@@ -86,26 +87,34 @@ MPEG1or2FileServerDemux::newElementaryStream(unsigned clientSessionId,
   } else {
     // First, check whether this is a new client session.  If so, create a new
     // demux for it:
-    if (clientSessionId != fLastClientSessionId) {
+    if (clientSessionId == fLastClientSessionId) {
+      demuxToUse = fLastCreatedDemux; // use the same demultiplexor as before
+    }
+
+    if (demuxToUse == NULL) {
       // Open our input file as a 'byte-stream file source':
       ByteStreamFileSource* fileSource
 	= ByteStreamFileSource::createNew(envir(), fFileName);
       if (fileSource == NULL) return NULL;
 
-      fLastCreatedDemux = MPEG1or2Demux::createNew(envir(), fileSource, True);
-      // Note: We tell the demux to delete itself when its last
-      // elementary stream is deleted.
-      fLastClientSessionId = clientSessionId;
-      // Note: This code relies upon the fact that the creation of streams for
-      // different client sessions do not overlap - so one "MPEG1or2Demux" is used
-      // at a time.
+      demuxToUse = MPEG1or2Demux::createNew(envir(), fileSource, True, onDemuxDeletion, this);
+        // Note: We tell the demux to delete itself when its last
+        // elementary stream is deleted.
     }
-    demuxToUse = fLastCreatedDemux;
+
+    fLastClientSessionId = clientSessionId;
+    fLastCreatedDemux = demuxToUse;
   }
 
-  if (demuxToUse == NULL) return NULL; // shouldn't happen
-
   return demuxToUse->newElementaryStream(streamIdTag);
+}
+
+void MPEG1or2FileServerDemux::onDemuxDeletion(void* clientData, MPEG1or2Demux* demuxBeingDeleted) {
+  ((MPEG1or2FileServerDemux*)clientData)->onDemuxDeletion(demuxBeingDeleted);
+}
+
+void MPEG1or2FileServerDemux::onDemuxDeletion(MPEG1or2Demux* demuxBeingDeleted) {
+  if (fLastCreatedDemux == demuxBeingDeleted) fLastCreatedDemux = NULL;
 }
 
 
@@ -170,7 +179,7 @@ public:
   MFSD_DummySink(MPEG1or2Demux& demux, Boolean returnFirstSeenCode);
   virtual ~MFSD_DummySink();
 
-  char watchVariable;
+  EventLoopWatchVariable watchVariable;
 
 private:
   // redefined virtual function:
@@ -240,7 +249,7 @@ void MFSD_DummySink::afterGettingFrame1() {
   if (fReturnFirstSeenCode && fOurDemux.lastSeenSCR().isValid) {
     // We were asked to return the first SCR that we saw, and we've seen one,
     // so we're done.  (Handle this as if the input source had closed.)
-    onSourceClosure(this);
+    onSourceClosure();
     return;
   }
 

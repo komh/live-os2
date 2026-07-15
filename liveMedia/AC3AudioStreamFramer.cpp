@@ -1,7 +1,7 @@
 /**********
 This library is free software; you can redistribute it and/or modify it under
 the terms of the GNU Lesser General Public License as published by the
-Free Software Foundation; either version 2.1 of the License, or (at your
+Free Software Foundation; either version 3 of the License, or (at your
 option) any later version. (See <http://www.gnu.org/copyleft/lesser.html>.)
 
 This library is distributed in the hope that it will be useful, but WITHOUT
@@ -14,7 +14,7 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 **********/
 // "liveMedia"
-// Copyright (c) 1996-2012 Live Networks, Inc.  All rights reserved.
+// Copyright (c) 1996-2026 Live Networks, Inc.  All rights reserved.
 // A filter that breaks up an AC3 audio elementary stream into frames
 // Implementation
 
@@ -73,7 +73,7 @@ private:
   Boolean fHaveParsedAFrame;
   unsigned char* fSavedFrame;
   unsigned fSavedFrameSize;
-  char fSavedFrameFlag;
+  EventLoopWatchVariable fSavedFrameFlag;
 
   // Parameters of the most recently read frame:
   AC3FrameParams fCurrentFrame;
@@ -224,6 +224,7 @@ AC3AudioStreamParser
 }
 
 AC3AudioStreamParser::~AC3AudioStreamParser() {
+  delete[] fSavedFrame;
 }
 
 void AC3AudioStreamParser::registerReadInterest(unsigned char* to,
@@ -303,7 +304,7 @@ unsigned AC3AudioStreamParser::parseFrame(unsigned& numTruncatedBytes) {
 
 void AC3AudioStreamParser::readAndSaveAFrame() {
   unsigned const maxAC3FrameSize = 4000;
-  fSavedFrame = new unsigned char[maxAC3FrameSize];
+  delete[] fSavedFrame; fSavedFrame = new unsigned char[maxAC3FrameSize];
   fSavedFrameSize = 0;
 
   fSavedFrameFlag = 0;

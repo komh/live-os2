@@ -1,7 +1,7 @@
 /**********
 This library is free software; you can redistribute it and/or modify it under
 the terms of the GNU Lesser General Public License as published by the
-Free Software Foundation; either version 2.1 of the License, or (at your
+Free Software Foundation; either version 3 of the License, or (at your
 option) any later version. (See <http://www.gnu.org/copyleft/lesser.html>.)
 
 This library is distributed in the hope that it will be useful, but WITHOUT
@@ -14,7 +14,7 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 **********/
 // "liveMedia"
-// Copyright (c) 1996-2012 Live Networks, Inc.  All rights reserved.
+// Copyright (c) 1996-2026 Live Networks, Inc.  All rights reserved.
 // Inclusion of header files representing the interface
 // for the entire library
 //
@@ -23,21 +23,30 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 
 #ifndef _LIVEMEDIA_HH
 #define _LIVEMEDIA_HH
-
+#include "JPEG2000VideoRTPSource.hh"
+#include "JPEG2000VideoRTPSink.hh"
+//#include "JPEG2000VideoStreamFramer.hh"
+//#include "JPEG2000VideoFileServerMediaSubsession.hh"
 #include "MPEG1or2AudioRTPSink.hh"
 #include "MP3ADURTPSink.hh"
 #include "MPEG1or2VideoRTPSink.hh"
 #include "MPEG4ESVideoRTPSink.hh"
 #include "AMRAudioFileSink.hh"
 #include "H264VideoFileSink.hh"
+#include "H265VideoFileSink.hh"
+#include "OggFileSink.hh"
 #include "BasicUDPSink.hh"
 #include "GSMAudioRTPSink.hh"
 #include "H263plusVideoRTPSink.hh"
 #include "H264VideoRTPSink.hh"
+#include "H265VideoRTPSink.hh"
 #include "DVVideoRTPSource.hh"
 #include "DVVideoRTPSink.hh"
 #include "DVVideoStreamFramer.hh"
+#include "H264VideoStreamFramer.hh"
+#include "H265VideoStreamFramer.hh"
 #include "H264VideoStreamDiscreteFramer.hh"
+#include "H265VideoStreamDiscreteFramer.hh"
 #include "JPEGVideoRTPSink.hh"
 #include "SimpleRTPSink.hh"
 #include "uLawAudioFilter.hh"
@@ -59,14 +68,19 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 #include "JPEGVideoSource.hh"
 #include "MPEG1or2VideoRTPSource.hh"
 #include "VorbisAudioRTPSource.hh"
+#include "TheoraVideoRTPSource.hh"
 #include "VP8VideoRTPSource.hh"
+#include "VP9VideoRTPSource.hh"
+#include "RawVideoRTPSource.hh"
 #include "MPEG2TransportStreamFromPESSource.hh"
 #include "MPEG2TransportStreamFromESSource.hh"
 #include "MPEG2TransportStreamFramer.hh"
 #include "ADTSAudioFileSource.hh"
+#include "ADTSAudioStreamDiscreteFramer.hh"
 #include "H261VideoRTPSource.hh"
 #include "H263plusVideoRTPSource.hh"
 #include "H264VideoRTPSource.hh"
+#include "H265VideoRTPSource.hh"
 #include "MP3FileSource.hh"
 #include "MP3ADU.hh"
 #include "MP3ADUinterleaving.hh"
@@ -78,15 +92,18 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 #include "AC3AudioRTPSource.hh"
 #include "AC3AudioRTPSink.hh"
 #include "VorbisAudioRTPSink.hh"
+#include "TheoraVideoRTPSink.hh"
 #include "VP8VideoRTPSink.hh"
+#include "VP9VideoRTPSink.hh"
 #include "MPEG4GenericRTPSink.hh"
+#include "RawVideoRTPSink.hh"
 #include "MPEG1or2VideoStreamDiscreteFramer.hh"
 #include "MPEG4VideoStreamDiscreteFramer.hh"
 #include "DeviceSource.hh"
 #include "AudioInputDevice.hh"
 #include "WAVAudioFileSource.hh"
 #include "StreamReplicator.hh"
-#include "RTSPServerSupportingHTTPStreaming.hh"
+#include "RTSPRegisterSender.hh"
 #include "RTSPClient.hh"
 #include "SIPClient.hh"
 #include "QuickTimeFileSink.hh"
@@ -95,12 +112,12 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 #include "PassiveServerMediaSubsession.hh"
 #include "MPEG4VideoFileServerMediaSubsession.hh"
 #include "H264VideoFileServerMediaSubsession.hh"
+#include "H265VideoFileServerMediaSubsession.hh"
 #include "WAVAudioFileServerMediaSubsession.hh"
 #include "AMRAudioFileServerMediaSubsession.hh"
 #include "AMRAudioFileSource.hh"
 #include "AMRAudioRTPSink.hh"
 #include "T140TextRTPSink.hh"
-#include "TCPStreamSink.hh"
 #include "MP3AudioFileServerMediaSubsession.hh"
 #include "MPEG1or2VideoFileServerMediaSubsession.hh"
 #include "MPEG1or2FileServerDemux.hh"
@@ -111,7 +128,10 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 #include "AC3AudioFileServerMediaSubsession.hh"
 #include "MPEG2TransportUDPServerMediaSubsession.hh"
 #include "MatroskaFileServerDemux.hh"
+#include "OggFileServerDemux.hh"
+#include "MPEG2TransportStreamDemux.hh"
 #include "ProxyServerMediaSession.hh"
-#include "DarwinInjector.hh"
+#include "HLSSegmenter.hh"
+#include "MPEG2TransportStreamAccumulator.hh"
 
 #endif

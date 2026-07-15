@@ -1,7 +1,7 @@
 /**********
 This library is free software; you can redistribute it and/or modify it under
 the terms of the GNU Lesser General Public License as published by the
-Free Software Foundation; either version 2.1 of the License, or (at your
+Free Software Foundation; either version 3 of the License, or (at your
 option) any later version. (See <http://www.gnu.org/copyleft/lesser.html>.)
 
 This library is distributed in the hope that it will be useful, but WITHOUT
@@ -13,7 +13,7 @@ You should have received a copy of the GNU Lesser General Public License
 along with this library; if not, write to the Free Software Foundation, Inc.,
 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 **********/
-// Copyright (c) 1996-2012 Live Networks, Inc.  All rights reserved.
+// Copyright (c) 1996-2026 Live Networks, Inc.  All rights reserved.
 // Usage Environment
 // C++ header
 
@@ -41,6 +41,12 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 #define NULL 0
 #endif
 
+#ifndef NO_STD_LIB
+#ifndef _LIBCPP_ATOMIC
+#include <atomic>
+#endif
+#endif
+
 #ifdef __BORLANDC__
 #define _setmode setmode
 #define _O_BINARY O_BINARY
@@ -52,7 +58,8 @@ class TaskScheduler; // forward
 
 class UsageEnvironment {
 public:
-  void reclaim();
+  Boolean reclaim();
+      // returns True iff we were actually able to delete our object
 
   // task scheduler:
   TaskScheduler& taskScheduler() const {return fScheduler;}
@@ -102,6 +109,12 @@ typedef void TaskFunc(void* clientData);
 typedef void* TaskToken;
 typedef u_int32_t EventTriggerId;
 
+#ifndef NO_STD_LIB
+typedef std::atomic_char EventLoopWatchVariable;
+#else
+typedef char volatile EventLoopWatchVariable;
+#endif
+
 class TaskScheduler {
 public:
   virtual ~TaskScheduler();
@@ -112,17 +125,20 @@ public:
 	// reach a scheduling point.
 	// (Does not delay if "microseconds" <= 0)
 	// Returns a token that can be used in a subsequent call to
-	// unscheduleDelayedTask()
+	// unscheduleDelayedTask() or rescheduleDelayedTask()
+        // (but only if the task has not yet occurred).
 
   virtual void unscheduleDelayedTask(TaskToken& prevTask) = 0;
 	// (Has no effect if "prevTask" == NULL)
         // Sets "prevTask" to NULL afterwards.
+        // Note: This MUST NOT be called if the scheduled task has already occurred.
 
   virtual void rescheduleDelayedTask(TaskToken& task,
 				     int64_t microseconds, TaskFunc* proc,
 				     void* clientData);
-  // Combines "unscheduleDelayedTask()" with "scheduleDelayedTask()"
-  // (setting "task" to the new task token).
+        // Combines "unscheduleDelayedTask()" with "scheduleDelayedTask()"
+        // (setting "task" to the new task token).
+        // Note: This MUST NOT be called if the scheduled task has already occurred.
 
   // For handling socket operations in the background (from the event loop):
   typedef void BackgroundHandlerProc(void* clientData, int mask);
@@ -136,7 +152,7 @@ public:
   virtual void moveSocketHandling(int oldSocketNum, int newSocketNum) = 0;
         // Changes any socket handling for "oldSocketNum" so that occurs with "newSocketNum" instead.
 
-  virtual void doEventLoop(char* watchVariable = NULL) = 0;
+  virtual void doEventLoop(EventLoopWatchVariable* watchVariable = NULL) = 0;
       // Causes further execution to take place within the event loop.
       // Delayed tasks, background I/O handling, and other events are handled, sequentially (as a single thread of control).
       // (If "watchVariable" is not NULL, then we return from this routine when *watchVariable != 0)
@@ -149,7 +165,13 @@ public:
   virtual void triggerEvent(EventTriggerId eventTriggerId, void* clientData = NULL) = 0;
       // Causes the (previously-registered) handler function for the specified event to be handled (from the event loop).
       // The handler function is called with "clientData" as parameter.
-      // Note: This function (unlike other library functions) may be called from an external thread - to signal an external event.
+      // Note: This function (unlike other library functions) may be called from an external thread
+      // - to signal an external event.
+      // (In fact, this is the *only* LIVE555 function that can be called from a non-LIVE555 thread.)
+      // (However, "triggerEvent()" should not be called with the same 'event trigger id' from
+      // different threads.  Also, once "triggerEvent()" is called with one 'event trigger id',
+      // it should not be called again with the same 'event trigger id' until after its event
+      // has been handled.)
 
   // The following two functions are deprecated, and are provided for backwards-compatibility only:
   void turnOnBackgroundReadHandling(int socketNum, BackgroundHandlerProc* handlerProc, void* clientData) {

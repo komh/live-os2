@@ -1,7 +1,7 @@
 /**********
 This library is free software; you can redistribute it and/or modify it under
 the terms of the GNU Lesser General Public License as published by the
-Free Software Foundation; either version 2.1 of the License, or (at your
+Free Software Foundation; either version 3 of the License, or (at your
 option) any later version. (See <http://www.gnu.org/copyleft/lesser.html>.)
 
 This library is distributed in the hope that it will be useful, but WITHOUT
@@ -14,7 +14,7 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 **********/
 // "liveMedia"
-// Copyright (c) 1996-2012 Live Networks, Inc.  All rights reserved.
+// Copyright (c) 1996-2026 Live Networks, Inc.  All rights reserved.
 // A class encapsulating the state of a MP3 stream
 // Implementation
 
@@ -24,12 +24,15 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 
 #if defined(__WIN32__) || defined(_WIN32)
 #define snprintf _snprintf
+#if _MSC_VER >= 1400 // 1400 == vs2005
+#define fileno _fileno
+#endif
 #endif
 
 #define MILLION 1000000
 
-MP3StreamState::MP3StreamState(UsageEnvironment& env)
-  : fEnv(env), fFid(NULL), fPresentationTimeScale(1) {
+MP3StreamState::MP3StreamState()
+  : fFid(NULL), fPresentationTimeScale(1) {
 }
 
 MP3StreamState::~MP3StreamState() {
@@ -139,7 +142,7 @@ unsigned MP3StreamState::findNextHeader(struct timeval& presentationTime) {
 Boolean MP3StreamState::readFrame(unsigned char* outBuf, unsigned outBufSize,
 				  unsigned& resultFrameSize,
 				  unsigned& resultDurationInMicroseconds) {
-  /* We assume that "mp3FindNextHeader()" has already been called */
+  /* We assume that "findNextHeader()" has already been called */
 
   resultFrameSize = 4 + fr().frameSize;
 
@@ -186,37 +189,15 @@ void MP3StreamState::getAttributes(char* buffer, unsigned bufferSize) const {
 #endif
 }
 
-void MP3StreamState::writeGetCmd(char const* hostName,
-				 unsigned short portNum,
-				 char const* fileName) {
-  char const* const getCmdFmt = "GET %s HTTP/1.1\r\nHost: %s:%d\r\n\r\n";
-
-  if (fFidIsReallyASocket) {
-    intptr_t fid_long = (intptr_t)fFid;
-    int sock = (int)fid_long;
-    char writeBuf[100];
-#if defined(IRIX) || defined(ALPHA) || defined(_QNX4) || defined(IMN_PIM) || defined(CRIS)
-    /* snprintf() isn't defined, so just use sprintf() */
-    /* This is a security risk if filename can come from an external user */
-    sprintf(writeBuf, getCmdFmt, fileName, hostName, portNum);
-#else
-    snprintf(writeBuf, sizeof writeBuf, getCmdFmt,
-	     fileName, hostName, portNum);
-#endif
-    send(sock, writeBuf, strlen(writeBuf), 0);
-  } else {
-    fprintf(fFid, getCmdFmt, fileName, hostName, portNum);
-    fflush(fFid);
-  }
-}
-
 // This is crufty old code that needs to be cleaned up #####
 #define HDRCMPMASK 0xfffffd00
 
 Boolean MP3StreamState::findNextFrame() {
   unsigned char hbuf[8];
   unsigned l; int i;
+#ifdef DEBUG_ERRORS
   int attempt = 0;
+#endif
 
  read_again:
   if (readFromStream(hbuf, 4) != 4) return False;
@@ -304,7 +285,9 @@ Boolean MP3StreamState::findNextFrame() {
 	 track within a short time (and hopefully without
 	 too much distortion in the audio output).  */
       do {
+#ifdef DEBUG_ERRORS
 	attempt++;
+#endif
 	memmove (&hbuf[0], &hbuf[1], 7);
 	if (readFromStream(&hbuf[3],1) != 1) {
 	  return False;
@@ -357,59 +340,9 @@ Boolean MP3StreamState::findNextFrame() {
   return True;
 }
 
-static Boolean socketIsReadable(int socket) {
-  const unsigned numFds = socket+1;
-  fd_set rd_set;
-  FD_ZERO(&rd_set);
-  FD_SET((unsigned)socket, &rd_set);
-  struct timeval timeout;
-  timeout.tv_sec = timeout.tv_usec = 0;
-
-  int result = select(numFds, &rd_set, NULL, NULL, &timeout);
-  return result != 0; // not > 0, because windows can return -1 for file sockets
-}
-
-static char watchVariable;
-
-static void checkFunc(void* /*clientData*/) {
-  watchVariable = ~0;
-}
-
-static void waitUntilSocketIsReadable(UsageEnvironment& env, int socket) {
-  while (!socketIsReadable(socket)) {
-    // Delay a short period of time before checking again.
-    unsigned usecsToDelay = 1000; // 1 ms
-    env.taskScheduler().scheduleDelayedTask(usecsToDelay,
-					    (TaskFunc*)checkFunc, (void*)NULL);
-    watchVariable = 0;
-    env.taskScheduler().doEventLoop(&watchVariable);
-        // This allows other tasks to run while we're waiting:
-  }
-}
-
 unsigned MP3StreamState::readFromStream(unsigned char* buf,
 					unsigned numChars) {
-  // Hack for doing socket I/O instead of file I/O (e.g., on Windows)
-  if (fFidIsReallyASocket) {
-    intptr_t fid_long = (intptr_t)fFid;
-    int sock = (int)fid_long;
-    unsigned totBytesRead = 0;
-    do {
-      waitUntilSocketIsReadable(fEnv, sock);
-      int bytesRead
-	= recv(sock, &((char*)buf)[totBytesRead], numChars-totBytesRead, 0);
-      if (bytesRead < 0) return 0;
-
-      totBytesRead += (unsigned)bytesRead;
-    } while (totBytesRead < numChars);
-
-    return totBytesRead;
-  } else {
-#ifndef _WIN32_WCE
-    waitUntilSocketIsReadable(fEnv, (int)fileno(fFid));
-#endif
-    return fread(buf, 1, numChars, fFid);
-  }
+  return fread(buf, 1, numChars, fFid);
 }
 
 #define XING_FRAMES_FLAG       0x0001

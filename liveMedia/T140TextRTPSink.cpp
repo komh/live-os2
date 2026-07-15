@@ -1,7 +1,7 @@
 /**********
 This library is free software; you can redistribute it and/or modify it under
 the terms of the GNU Lesser General Public License as published by the
-Free Software Foundation; either version 2.1 of the License, or (at your
+Free Software Foundation; either version 3 of the License, or (at your
 option) any later version. (See <http://www.gnu.org/copyleft/lesser.html>.)
 
 This library is distributed in the hope that it will be useful, but WITHOUT
@@ -14,7 +14,7 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 **********/
 // "liveMedia"
-// Copyright (c) 1996-2012 Live Networks, Inc.  All rights reserved.
+// Copyright (c) 1996-2026 Live Networks, Inc.  All rights reserved.
 // RTP sink for T.140 text (RFC 2793)
 // Implementation
 
@@ -143,6 +143,7 @@ void T140IdleFilter::handleIdleTimeout(void* clientData) {
 }
 
 void T140IdleFilter::handleIdleTimeout() {
+  fIdleTimerTask = NULL;
   // No data has arrived from the upstream source within our specified 'idle period' (after data was requested from downstream).
   // Send an empty 'idle' frame to our downstream "T140TextRTPSink".  (This will cause an empty RTP packet to get sent.)
   deliverEmptyFrame();
@@ -178,7 +179,6 @@ void T140IdleFilter::onSourceClosure(void* clientData) {
 
 void T140IdleFilter::onSourceClosure() {
   envir().taskScheduler().unscheduleDelayedTask(fIdleTimerTask);
-  fIdleTimerTask = NULL;
 
-  FramedSource::handleClosure(this);
+  handleClosure();
 }

@@ -1,7 +1,7 @@
 /**********
 This library is free software; you can redistribute it and/or modify it under
 the terms of the GNU Lesser General Public License as published by the
-Free Software Foundation; either version 2.1 of the License, or (at your
+Free Software Foundation; either version 3 of the License, or (at your
 option) any later version. (See <http://www.gnu.org/copyleft/lesser.html>.)
 
 This library is distributed in the hope that it will be useful, but WITHOUT
@@ -14,13 +14,16 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 **********/
 // "liveMedia"
-// Copyright (c) 1996-2012 Live Networks, Inc.  All rights reserved.
+// Copyright (c) 1996-2026 Live Networks, Inc.  All rights reserved.
 // RTCP
 // Implementation
 
 #include "RTCP.hh"
 #include "GroupsockHelper.hh"
 #include "rtcp_from_spec.h"
+#if defined(__WIN32__) || defined(_WIN32) || defined(_QNX4)
+#define snprintf _snprintf
+#endif
 
 ////////// RTCPMemberDatabase //////////
 
@@ -35,11 +38,11 @@ public:
 	delete fTable;
   }
 
-  Boolean isMember(unsigned ssrc) const {
+  Boolean isMember(u_int32_t ssrc) const {
     return fTable->Lookup((char*)(long)ssrc) != NULL;
   }
 
-  Boolean noteMembership(unsigned ssrc, unsigned curTimeCount) {
+  Boolean noteMembership(u_int32_t ssrc, unsigned curTimeCount) {
     Boolean isNew = !isMember(ssrc);
 
     if (isNew) {
@@ -52,7 +55,7 @@ public:
     return isNew;
   }
 
-  Boolean remove(unsigned ssrc) {
+  Boolean remove(u_int32_t ssrc) {
     Boolean wasPresent = fTable->Remove((char*)(long)ssrc);
     if (wasPresent) {
       --fNumMembers;
@@ -99,7 +102,7 @@ void RTCPMemberDatabase::reapOldMembers(unsigned threshold) {
 #ifdef DEBUG
         fprintf(stderr, "reap: removing SSRC 0x%x\n", oldSSRC);
 #endif
-      fOurRTCPInstance.removeSSRC(oldSSRC, True);
+	fOurRTCPInstance.removeSSRC(oldSSRC, False/*keep stats around*/);
     }
   } while (foundOldMember);
 }
@@ -113,35 +116,39 @@ static double dTimeNow() {
     return (double) (timeNow.tv_sec + timeNow.tv_usec/1000000.0);
 }
 
-static unsigned const maxRTCPPacketSize = 1450;
-	// bytes (1500, minus some allowance for IP, UDP, UMTP headers)
-static unsigned const preferredPacketSize = 1000; // bytes
+static unsigned const maxRTCPPacketSize = 1438;
+	// bytes (1500, minus some allowance for IP, UDP headers; SRTCP trailers)
+static unsigned const preferredRTCPPacketSize = 1000; // bytes
 
 RTCPInstance::RTCPInstance(UsageEnvironment& env, Groupsock* RTCPgs,
 			   unsigned totSessionBW,
 			   unsigned char const* cname,
-			   RTPSink* sink, RTPSource const* source,
-			   Boolean isSSMSource)
+			   RTPSink* sink, RTPSource* source,
+			   Boolean isSSMTransmitter,
+			   SRTPCryptographicContext* crypto)
   : Medium(env), fRTCPInterface(this, RTCPgs), fTotSessionBW(totSessionBW),
-    fSink(sink), fSource(source), fIsSSMSource(isSSMSource),
+    fSink(sink), fSource(source), fIsSSMTransmitter(isSSMTransmitter), fCrypto(crypto),
     fCNAME(RTCP_SDES_CNAME, cname), fOutgoingReportCount(1),
     fAveRTCPSize(0), fIsInitial(1), fPrevNumMembers(0),
     fLastSentSize(0), fLastReceivedSize(0), fLastReceivedSSRC(0),
     fTypeOfEvent(EVENT_UNKNOWN), fTypeOfPacket(PACKET_UNKNOWN_TYPE),
     fHaveJustSentPacket(False), fLastPacketSentSize(0),
-    fByeHandlerTask(NULL), fByeHandlerClientData(NULL),
+    fByeHandlerTask(NULL), fByeWithReasonHandlerTask(NULL), fByeHandlerClientData(NULL),
     fSRHandlerTask(NULL), fSRHandlerClientData(NULL),
     fRRHandlerTask(NULL), fRRHandlerClientData(NULL),
-    fSpecificRRHandlerTable(NULL) {
+    fSpecificRRHandlerTable(NULL),
+    fAppHandlerTask(NULL), fAppHandlerClientData(NULL) {
 #ifdef DEBUG
   fprintf(stderr, "RTCPInstance[%p]::RTCPInstance()\n", this);
 #endif
+  setupForSRTCP();
+
   if (fTotSessionBW == 0) { // not allowed!
     env << "RTCPInstance::RTCPInstance error: totSessionBW parameter should not be zero!\n";
     fTotSessionBW = 1;
   }
 
-  if (isSSMSource) RTCPgs->multicastSendOnly(); // don't receive multicast
+  if (isSSMTransmitter) RTCPgs->multicastSendOnly(); // don't receive multicast
 
   double timeNow = dTimeNow();
   fPrevReportTime = fNextReportTime = timeNow;
@@ -151,17 +158,19 @@ RTCPInstance::RTCPInstance(UsageEnvironment& env, Groupsock* RTCPgs,
   if (fKnownMembers == NULL || fInBuf == NULL) return;
   fNumBytesAlreadyRead = 0;
 
-  // A hack to save buffer space, because RTCP packets are always small:
-  unsigned savedMaxSize = OutPacketBuffer::maxSize;
-  OutPacketBuffer::maxSize = maxRTCPPacketSize;
-  fOutBuf = new OutPacketBuffer(preferredPacketSize, maxRTCPPacketSize);
-  OutPacketBuffer::maxSize = savedMaxSize;
+  fOutBuf = new OutPacketBuffer(preferredRTCPPacketSize, maxRTCPPacketSize, 1500);
   if (fOutBuf == NULL) return;
 
-  // Arrange to handle incoming reports from others:
-  TaskScheduler::BackgroundHandlerProc* handler
-    = (TaskScheduler::BackgroundHandlerProc*)&incomingReportHandler;
-  fRTCPInterface.startNetworkReading(handler);
+  if (fSource != NULL && fSource->RTPgs() == RTCPgs) {
+    // We're receiving RTCP reports that are multiplexed with RTP, so ask the RTP source
+    // to give them to us:
+    fSource->registerForMultiplexedRTCPPackets(this);
+  } else {
+    // Arrange to handle incoming reports from the network:
+    TaskScheduler::BackgroundHandlerProc* handler
+      = (TaskScheduler::BackgroundHandlerProc*)&incomingReportHandler;
+    fRTCPInterface.startNetworkReading(handler);
+  }
 
   // Send our first report.
   fTypeOfEvent = EVENT_REPORT;
@@ -177,13 +186,18 @@ RTCPInstance::~RTCPInstance() {
 #ifdef DEBUG
   fprintf(stderr, "RTCPInstance[%p]::~RTCPInstance()\n", this);
 #endif
-  // Turn off background read handling:
-  fRTCPInterface.stopNetworkReading();
-
   // Begin by sending a BYE.  We have to do this immediately, without
   // 'reconsideration', because "this" is going away.
   fTypeOfEvent = EVENT_BYE; // not used, but...
   sendBYE();
+
+  if (fSource != NULL && fSource->RTPgs() == fRTCPInterface.gs()) {
+    // We were receiving RTCP reports that were multiplexed with RTP, so tell the RTP source
+    // to stop giving them to us:
+    fSource->deregisterForMultiplexedRTCPPackets();
+    fRTCPInterface.forgetOurGroupsock();
+      // so that the "fRTCPInterface" destructor doesn't turn off background read handling
+  }
 
   if (fSpecificRRHandlerTable != NULL) {
     AddressPortLookupTable::Iterator iter(*fSpecificRRHandlerTable);
@@ -199,13 +213,47 @@ RTCPInstance::~RTCPInstance() {
   delete[] fInBuf;
 }
 
+void RTCPInstance::noteArrivingRR(struct sockaddr_storage const& fromAddressAndPort,
+				  int tcpSocketNum, unsigned char tcpStreamChannelId) {
+  // If a 'RR handler' was set, call it now:
+
+  // Specific RR handler:
+  if (fSpecificRRHandlerTable != NULL) {
+    struct sockaddr_storage fromAddress;
+    portNumBits fromPortNum;
+    if (tcpSocketNum < 0) {
+      // Normal case: We read the RTCP packet over UDP
+      fromAddress = fromAddressAndPort;
+      fromPortNum = ntohs(portNum(fromAddressAndPort));
+    } else {
+      // Special case: We read the RTCP packet over TCP (interleaved)
+      // Hack: Use the TCP socket number and channel id to look up the handler
+      fromAddress.ss_family = AF_INET;
+      ((sockaddr_in&)fromAddress).sin_addr.s_addr = tcpSocketNum;
+      fromPortNum = tcpStreamChannelId;
+    }
+    Port fromPort(fromPortNum);
+    RRHandlerRecord* rrHandler
+      = (RRHandlerRecord*)(fSpecificRRHandlerTable->Lookup(fromAddress, fromPort));
+    if (rrHandler != NULL) {
+      if (rrHandler->rrHandlerTask != NULL) {
+	(*(rrHandler->rrHandlerTask))(rrHandler->rrHandlerClientData);
+      }
+    }
+  }
+  
+  // General RR handler:
+  if (fRRHandlerTask != NULL) (*fRRHandlerTask)(fRRHandlerClientData);
+}
+
 RTCPInstance* RTCPInstance::createNew(UsageEnvironment& env, Groupsock* RTCPgs,
 				      unsigned totSessionBW,
 				      unsigned char const* cname,
-				      RTPSink* sink, RTPSource const* source,
-				      Boolean isSSMSource) {
+				      RTPSink* sink, RTPSource* source,
+				      Boolean isSSMTransmitter,
+				      SRTPCryptographicContext* crypt) {
   return new RTCPInstance(env, RTCPgs, totSessionBW, cname, sink, source,
-			  isSSMSource);
+			  isSSMTransmitter, crypt);
 }
 
 Boolean RTCPInstance::lookupByName(UsageEnvironment& env,
@@ -235,9 +283,24 @@ unsigned RTCPInstance::numMembers() const {
   return fKnownMembers->numMembers();
 }
 
+void RTCPInstance::setupForSRTCP() {
+  if (fSink != NULL) { // take crypto state (if any) from the sink:
+    fCrypto = fSink->getCrypto();
+  }
+}
+
 void RTCPInstance::setByeHandler(TaskFunc* handlerTask, void* clientData,
 				 Boolean handleActiveParticipantsOnly) {
   fByeHandlerTask = handlerTask;
+  fByeWithReasonHandlerTask = NULL;
+  fByeHandlerClientData = clientData;
+  fByeHandleActiveParticipantsOnly = handleActiveParticipantsOnly;
+}
+
+void RTCPInstance::setByeWithReasonHandler(ByeWithReasonHandlerFunc* handlerTask, void* clientData,
+					   Boolean handleActiveParticipantsOnly) {
+  fByeHandlerTask = NULL;
+  fByeWithReasonHandlerTask = handlerTask;
   fByeHandlerClientData = clientData;
   fByeHandleActiveParticipantsOnly = handleActiveParticipantsOnly;
 }
@@ -253,7 +316,7 @@ void RTCPInstance::setRRHandler(TaskFunc* handlerTask, void* clientData) {
 }
 
 void RTCPInstance
-::setSpecificRRHandler(netAddressBits fromAddress, Port fromPort,
+::setSpecificRRHandler(struct sockaddr_storage const& fromAddress, Port fromPort,
 		       TaskFunc* handlerTask, void* clientData) {
   if (handlerTask == NULL && clientData == NULL) {
     unsetSpecificRRHandler(fromAddress, fromPort);
@@ -266,28 +329,71 @@ void RTCPInstance
   if (fSpecificRRHandlerTable == NULL) {
     fSpecificRRHandlerTable = new AddressPortLookupTable;
   }
-  fSpecificRRHandlerTable->Add(fromAddress, (~0), fromPort, rrHandler);
+  RRHandlerRecord* existingRecord
+    = (RRHandlerRecord*)fSpecificRRHandlerTable->Add(fromAddress, fromPort, rrHandler);
+  delete existingRecord; // if any
+
 }
 
 void RTCPInstance
-::unsetSpecificRRHandler(netAddressBits fromAddress, Port fromPort) {
+::unsetSpecificRRHandler(struct sockaddr_storage const& fromAddress, Port fromPort) {
   if (fSpecificRRHandlerTable == NULL) return;
 
   RRHandlerRecord* rrHandler
-    = (RRHandlerRecord*)(fSpecificRRHandlerTable->Lookup(fromAddress, (~0), fromPort));
+    = (RRHandlerRecord*)(fSpecificRRHandlerTable->Lookup(fromAddress, fromPort));
   if (rrHandler != NULL) {
-    fSpecificRRHandlerTable->Remove(fromAddress, (~0), fromPort);
+    fSpecificRRHandlerTable->Remove(fromAddress, fromPort);
     delete rrHandler;
   }
 }
 
-void RTCPInstance::setStreamSocket(int sockNum,
-				   unsigned char streamChannelId) {
+void RTCPInstance::setAppHandler(RTCPAppHandlerFunc* handlerTask, void* clientData) {
+  fAppHandlerTask = handlerTask;
+  fAppHandlerClientData = clientData;
+}
+
+void RTCPInstance::sendAppPacket(u_int8_t subtype, char const* name,
+				 u_int8_t* appDependentData, unsigned appDependentDataSize) {
+  // Set up the first 4 bytes: V,PT,subtype,PT,length:
+  u_int32_t rtcpHdr = 0x80000000; // version 2, no padding
+  rtcpHdr |= (subtype&0x1F)<<24;
+  rtcpHdr |= (RTCP_PT_APP<<16);
+  unsigned length = 2 + (appDependentDataSize+3)/4;
+  rtcpHdr |= (length&0xFFFF);
+  fOutBuf->enqueueWord(rtcpHdr);
+
+  // Set up the next 4 bytes: SSRC:
+  fOutBuf->enqueueWord(fSource != NULL ? fSource->SSRC() : fSink != NULL ? fSink->SSRC() : 0);
+
+  // Set up the next 4 bytes: name:
+  char nameBytes[4];
+  nameBytes[0] = nameBytes[1] = nameBytes[2] = nameBytes[3] = '\0'; // by default
+  if (name != NULL) {
+    snprintf(nameBytes, 4, "%s", name);
+  }
+  fOutBuf->enqueue((u_int8_t*)nameBytes, 4);
+
+  // Set up the remaining bytes (if any): application-dependent data (+ padding):
+  if (appDependentData != NULL && appDependentDataSize > 0) {
+    fOutBuf->enqueue(appDependentData, appDependentDataSize);
+
+    unsigned modulo = appDependentDataSize%4;
+    unsigned paddingSize = modulo == 0 ? 0 : 4-modulo;
+    u_int8_t const paddingByte = 0x00;
+    for (unsigned i = 0; i < paddingSize; ++i) fOutBuf->enqueue(&paddingByte, 1);
+  }
+
+  // Finally, send the packet:
+  sendBuiltPacket();
+}
+
+void RTCPInstance::setStreamSocket(int sockNum, unsigned char streamChannelId,
+				   TLSState* tlsState) {
   // Turn off background read handling:
   fRTCPInterface.stopNetworkReading();
 
   // Switch to RTCP-over-TCP:
-  fRTCPInterface.setStreamSocket(sockNum, streamChannelId);
+  fRTCPInterface.setStreamSocket(sockNum, streamChannelId, tlsState);
 
   // Turn background reading back on:
   TaskScheduler::BackgroundHandlerProc* handler
@@ -295,18 +401,26 @@ void RTCPInstance::setStreamSocket(int sockNum,
   fRTCPInterface.startNetworkReading(handler);
 }
 
-void RTCPInstance::addStreamSocket(int sockNum,
-				   unsigned char streamChannelId) {
+void RTCPInstance::addStreamSocket(int sockNum, unsigned char streamChannelId,
+				   TLSState* tlsState) {
   // First, turn off background read handling for the default (UDP) socket:
   envir().taskScheduler().turnOffBackgroundReadHandling(fRTCPInterface.gs()->socketNum());
 
   // Add the RTCP-over-TCP interface:
-  fRTCPInterface.addStreamSocket(sockNum, streamChannelId);
+  fRTCPInterface.addStreamSocket(sockNum, streamChannelId, tlsState);
 
   // Turn on background reading for this socket (in case it's not on already):
   TaskScheduler::BackgroundHandlerProc* handler
     = (TaskScheduler::BackgroundHandlerProc*)&incomingReportHandler;
   fRTCPInterface.startNetworkReading(handler);
+}
+
+void RTCPInstance
+::injectReport(u_int8_t const* packet, unsigned packetSize, struct sockaddr_storage const& fromAddress) {
+  if (packetSize > maxRTCPPacketSize) packetSize = maxRTCPPacketSize;
+  memmove(fInBuf, packet, packetSize);
+
+  processIncomingReport(packetSize, fromAddress, -1, 0xFF); // assume report received over UDP
 }
 
 static unsigned const IP_UDP_HDR_SIZE = 28;
@@ -321,20 +435,25 @@ void RTCPInstance::incomingReportHandler(RTCPInstance* instance,
 
 void RTCPInstance::incomingReportHandler1() {
   do {
-    Boolean callByeHandler = False;
-    int tcpReadStreamSocketNum = fRTCPInterface.nextTCPReadStreamSocketNum();
-    unsigned char tcpReadStreamChannelId = fRTCPInterface.nextTCPReadStreamChannelId();
-    unsigned packetSize = 0;
-    unsigned numBytesRead;
-    struct sockaddr_in fromAddress;
-    Boolean packetReadWasIncomplete;
     if (fNumBytesAlreadyRead >= maxRTCPPacketSize) {
-      envir() << "RTCPInstance error: Hit limit when reading incoming packet over TCP. Increase \"maxRTCPPacketSize\"\n";
+      envir() << "RTCPInstance error: Hit limit when reading incoming packet over TCP. (fNumBytesAlreadyRead ("
+	      << fNumBytesAlreadyRead << ") >= maxRTCPPacketSize (" << maxRTCPPacketSize
+	      << ")).  The remote endpoint is using a buggy implementation of RTP/RTCP-over-TCP.  Please upgrade it!\n";
       break;
     }
+
+    unsigned numBytesRead;
+    struct sockaddr_storage fromAddress;
+    int tcpSocketNum;
+    unsigned char tcpStreamChannelId;
+    Boolean packetReadWasIncomplete;
     Boolean readResult
       = fRTCPInterface.handleRead(&fInBuf[fNumBytesAlreadyRead], maxRTCPPacketSize - fNumBytesAlreadyRead,
-				  numBytesRead, fromAddress, packetReadWasIncomplete);
+				  numBytesRead, fromAddress,
+				  tcpSocketNum, tcpStreamChannelId,
+				  packetReadWasIncomplete);
+
+    unsigned packetSize = 0;
     if (packetReadWasIncomplete) {
       fNumBytesAlreadyRead += numBytesRead;
       return; // more reads are needed to get the entire packet
@@ -360,35 +479,57 @@ void RTCPInstance::incomingReportHandler1() {
       }
     }
 
-    unsigned char* pkt = fInBuf;
-    if (fIsSSMSource && !packetWasFromOurHost) {
-      // This packet is assumed to have been received via unicast (because we're a SSM source, and SSM receivers send back RTCP "RR"
-      // packets via unicast).  'Reflect' the packet by resending it to the multicast group, so that any other receivers can also
-      // get to see it.
+    if (fIsSSMTransmitter && !packetWasFromOurHost) {
+      // This packet is assumed to have been received via unicast (because we're
+      // a SSM transmitter, and SSM receivers send back RTCP "RR" packets via unicast).
+      // 'Reflect' the packet by resending it to the multicast group, so that any other receivers
+      // can also get to see it.
 
       // NOTE: Denial-of-service attacks are possible here.
       // Users of this software may wish to add their own,
       // application-specific mechanism for 'authenticating' the
       // validity of this packet before reflecting it.
 
-      // NOTE: The test for "!packetWasFromOurHost" means that we won't reflect RTCP packets that come from other processes on
-      // the same host as us.  The reason for this is that the 'packet size' test above is not 100% reliable; some packets
-      // that were truly looped back from us might not be detected as such, and this might lead to infinite forwarding/receiving
-      // of some packets.  To avoid this possibility, we only reflect RTCP packets that we know for sure originated elsewhere.
-      // (Note, though, that if we ever re-enable the code in "Groupsock::multicastSendOnly()", then we could remove the test for
-      // "!packetWasFromOurHost".)
-      fRTCPInterface.sendPacket(pkt, packetSize);
+      // NOTE: The test for "!packetWasFromOurHost" means that we won't reflect RTCP packets
+      // that come from other processes on the same host as us.  The reason for this is that the
+      // 'packet size' test above is not 100% reliable; some packets that were truly looped back
+      // from us might not be detected as such, and this might lead to infinite
+      // forwarding/receiving of some packets.  To avoid this possibility, we reflect only
+      // RTCP packets that we know for sure originated elsewhere.
+      // (Note, though, that if we ever re-enable the code in "Groupsock::multicastSendOnly()",
+      // then we could remove the test for "!packetWasFromOurHost".)
+      fRTCPInterface.sendPacket(fInBuf, packetSize);
       fHaveJustSentPacket = True;
       fLastPacketSentSize = packetSize;
     }
 
-#ifdef DEBUG
-    fprintf(stderr, "[%p]saw incoming RTCP packet", this);
-    if (tcpReadStreamSocketNum < 0) {
-      // Note that "fromAddress" is valid only if we're receiving over UDP (not over TCP):
-      fprintf(stderr, " (from address %s, port %d)", AddressString(fromAddress).val(), ntohs(fromAddress.sin_port));
+    processIncomingReport(packetSize, fromAddress, tcpSocketNum, tcpStreamChannelId);
+  } while (0);
+}
+
+void RTCPInstance
+::processIncomingReport(unsigned packetSize, struct sockaddr_storage const& fromAddressAndPort,
+			int tcpSocketNum, unsigned char tcpStreamChannelId) {
+  do {
+    if (fCrypto != NULL) { // The packet is assumed to be SRTCP.  Verify/decrypt it first:
+      unsigned newPacketSize;
+      if (!fCrypto->processIncomingSRTCPPacket(fInBuf, packetSize, newPacketSize)) break;
+      packetSize = newPacketSize;
     }
-    fprintf(stderr, "\n");
+
+    Boolean callByeHandler = False;
+    char* reason = NULL; // by default, unless/until a BYE packet with a 'reason' arrives
+    unsigned char* pkt = fInBuf;
+
+#ifdef DEBUG
+    fprintf(stderr, "[%p]saw incoming RTCP packet (from ", this);
+    if (tcpSocketNum < 0) {
+      // Note that "fromAddressAndPort" is valid only if we're receiving over UDP (not over TCP):
+      fprintf(stderr, "address %s, port %d", AddressString(fromAddressAndPort).val(), ntohs(portNum(fromAddressAndPort)));
+    } else {
+      fprintf(stderr, "TCP socket #%d, stream channel id %d", tcpSocketNum, tcpStreamChannelId);
+    }
+    fprintf(stderr, ")\n");
     for (unsigned i = 0; i < packetSize; ++i) {
       if (i%4 == 0) fprintf(stderr, " ");
       fprintf(stderr, "%02x", pkt[i]);
@@ -400,10 +541,11 @@ void RTCPInstance::incomingReportHandler1() {
     // Check the RTCP packet for validity:
     // It must at least contain a header (4 bytes), and this header
     // must be version=2, with no padding bit, and a payload type of
-    // SR (200) or RR (201):
+    // SR (200), RR (201), or APP (204):
     if (packetSize < 4) break;
     unsigned rtcpHdr = ntohl(*(u_int32_t*)pkt);
-    if ((rtcpHdr & 0xE0FE0000) != (0x80000000 | (RTCP_PT_SR<<16))) {
+    if ((rtcpHdr & 0xE0FE0000) != (0x80000000 | (RTCP_PT_SR<<16)) &&
+	(rtcpHdr & 0xE0FF0000) != (0x80000000 | (RTCP_PT_APP<<16))) {
 #ifdef DEBUG
       fprintf(stderr, "rejected bad RTCP packet: header 0x%08x\n", rtcpHdr);
 #endif
@@ -416,8 +558,8 @@ void RTCPInstance::incomingReportHandler1() {
     unsigned reportSenderSSRC = 0;
     Boolean packetOK = False;
     while (1) {
-      unsigned rc = (rtcpHdr>>24)&0x1F;
-      unsigned pt = (rtcpHdr>>16)&0xFF;
+      u_int8_t rc = (rtcpHdr>>24)&0x1F;
+      u_int8_t pt = (rtcpHdr>>16)&0xFF;
       unsigned length = 4*(rtcpHdr&0xFFFF); // doesn't count hdr
       ADVANCE(4); // skip over the header
       if (length > packetSize) break;
@@ -425,6 +567,15 @@ void RTCPInstance::incomingReportHandler1() {
       // Assume that each RTCP subpacket begins with a 4-byte SSRC:
       if (length < 4) break; length -= 4;
       reportSenderSSRC = ntohl(*(u_int32_t*)pkt); ADVANCE(4);
+#ifdef HACK_FOR_CHROME_WEBRTC_BUG
+      if (reportSenderSSRC == 0x00000001 && pt == RTCP_PT_RR) {
+	// Chrome (and Opera) WebRTC receivers have a bug that causes them to always send
+	// SSRC 1 in their "RR"s.  To work around this (to help us distinguish between different
+	// receivers), we use a fake SSRC in this case consisting of the IP address, XORed with
+	// the port number:
+	reportSenderSSRC = fromAddressAndPort.sin_addr.s_addr^portNum(fromAddressAndPort);
+      }
+#endif
 
       Boolean subPacketOK = False;
       switch (pt) {
@@ -471,7 +622,7 @@ void RTCPInstance::incomingReportHandler1() {
                 unsigned jitter = ntohl(*(u_int32_t*)pkt); ADVANCE(4);
                 unsigned timeLastSR = ntohl(*(u_int32_t*)pkt); ADVANCE(4);
                 unsigned timeSinceLastSR = ntohl(*(u_int32_t*)pkt); ADVANCE(4);
-                transmissionStats.noteIncomingRR(reportSenderSSRC, fromAddress,
+                transmissionStats.noteIncomingRR(reportSenderSSRC, fromAddressAndPort,
 						 lossStats,
 						 highestReceived, jitter,
 						 timeLastSR, timeSinceLastSR);
@@ -484,34 +635,7 @@ void RTCPInstance::incomingReportHandler1() {
           }
 
 	  if (pt == RTCP_PT_RR) { // i.e., we didn't fall through from 'SR'
-	    // If a 'RR handler' was set, call it now:
-
-	    // Specific RR handler:
-	    if (fSpecificRRHandlerTable != NULL) {
-	      netAddressBits fromAddr;
-	      portNumBits fromPortNum;
-	      if (tcpReadStreamSocketNum < 0) {
-		// Normal case: We read the RTCP packet over UDP
-		fromAddr = fromAddress.sin_addr.s_addr;
-		fromPortNum = ntohs(fromAddress.sin_port);
-	      } else {
-		// Special case: We read the RTCP packet over TCP (interleaved)
-		// Hack: Use the TCP socket and channel id to look up the handler
-		fromAddr = tcpReadStreamSocketNum;
-		fromPortNum = tcpReadStreamChannelId;
-	      }
-	      Port fromPort(fromPortNum);
-	      RRHandlerRecord* rrHandler
-		= (RRHandlerRecord*)(fSpecificRRHandlerTable->Lookup(fromAddr, (~0), fromPort));
-	      if (rrHandler != NULL) {
-		if (rrHandler->rrHandlerTask != NULL) {
-		  (*(rrHandler->rrHandlerTask))(rrHandler->rrHandlerClientData);
-		}
-	      }
-	    }
-
-	    // General RR handler:
-	    if (fRRHandlerTask != NULL) (*fRRHandlerTask)(fRRHandlerClientData);
+	    noteArrivingRR(fromAddressAndPort, tcpSocketNum, tcpStreamChannelId);
 	  }
 
 	  subPacketOK = True;
@@ -520,11 +644,34 @@ void RTCPInstance::incomingReportHandler1() {
 	}
         case RTCP_PT_BYE: {
 #ifdef DEBUG
-	  fprintf(stderr, "BYE\n");
+	  fprintf(stderr, "BYE");
+#endif
+	  // Check whether there was a 'reason for leaving':
+	  if (length > 0) {
+	    u_int8_t reasonLength = *pkt;
+	    if (reasonLength > length-1) {
+	      // The 'reason' length field is too large!
+#ifdef DEBUG
+	      fprintf(stderr, "\nError: The 'reason' length %d is too large (it should be <= %d)\n",
+		      reasonLength, length-1);
+#endif
+	      reasonLength = length-1;
+	    }
+	    reason = new char[reasonLength + 1];
+	    for (unsigned i = 0; i < reasonLength; ++i) {
+	      reason[i] = pkt[1+i];
+	    }
+	    reason[reasonLength] = '\0';
+#ifdef DEBUG
+	    fprintf(stderr, " (reason:%s)", reason);
+#endif
+	  }
+#ifdef DEBUG
+	  fprintf(stderr, "\n");
 #endif
 	  // If a 'BYE handler' was set, arrange for it to be called at the end of this routine.
 	  // (Note: We don't call it immediately, in case it happens to cause "this" to be deleted.)
-	  if (fByeHandlerTask != NULL
+	  if ((fByeHandlerTask != NULL || fByeWithReasonHandlerTask != NULL)
 	      && (!fByeHandleActiveParticipantsOnly
 		  || (fSource != NULL
 		      && fSource->receptionStatsDB().lookup(reportSenderSSRC) != NULL)
@@ -539,20 +686,162 @@ void RTCPInstance::incomingReportHandler1() {
 	  typeOfPacket = PACKET_BYE;
 	  break;
 	}
-	// Later handle SDES, APP, and compound RTCP packets #####
-        default:
+        case RTCP_PT_APP: {
+	  u_int8_t& subtype = rc; // In "APP" packets, the "rc" field gets used as "subtype"
 #ifdef DEBUG
-	  fprintf(stderr, "UNSUPPORTED TYPE(0x%x)\n", pt);
+	  fprintf(stderr, "APP (subtype 0x%02x)\n", subtype);
+#endif
+	  if (length < 4) {
+#ifdef DEBUG
+	    fprintf(stderr, "\tError: No \"name\" field!\n");
+#endif
+	    break;
+	  }
+	  length -= 4;
+#ifdef DEBUG
+	  fprintf(stderr, "\tname:%c%c%c%c\n", pkt[0], pkt[1], pkt[2], pkt[3]);
+#endif
+	  u_int32_t nameBytes = (pkt[0]<<24)|(pkt[1]<<16)|(pkt[2]<<8)|(pkt[3]);
+	  ADVANCE(4); // skip over "name", to the 'application-dependent data'
+#ifdef DEBUG
+	  fprintf(stderr, "\tapplication-dependent data size: %d bytes\n", length);
+#endif
+
+	  // If an 'APP' packet handler was set, call it now:
+	  if (fAppHandlerTask != NULL) {
+	    (*fAppHandlerTask)(fAppHandlerClientData, subtype, nameBytes, pkt, length);
+	  }
+	  subPacketOK = True;
+	  typeOfPacket = PACKET_RTCP_APP;
+	  break;
+	}
+	// Other RTCP packet types that we don't yet handle:
+        case RTCP_PT_SDES: {
+#ifdef DEBUG
+	  // 'Handle' SDES packets only in debugging code, by printing out the 'SDES items':
+	  fprintf(stderr, "SDES\n");
+
+	  // Process each 'chunk':
+	  Boolean chunkOK = False;
+	  ADVANCE(-4); length += 4; // hack so that we see the first SSRC/CSRC again
+	  while (length >= 8) { // A valid chunk must be at least 8 bytes long
+	    chunkOK = False; // until we learn otherwise
+
+	    u_int32_t SSRC_CSRC = ntohl(*(u_int32_t*)pkt); ADVANCE(4); length -= 4;
+	    fprintf(stderr, "\tSSRC/CSRC: 0x%08x\n", SSRC_CSRC);
+
+	    // Process each 'SDES item' in the chunk:
+	    u_int8_t itemType = *pkt; ADVANCE(1); --length;
+	    while (itemType != 0) {
+	      unsigned itemLen = *pkt; ADVANCE(1); --length;
+	      // Make sure "itemLen" allows for at least 1 zero byte at the end of the chunk:
+	      if (itemLen + 1 > length || pkt[itemLen] != 0) break;
+
+	      fprintf(stderr, "\t\t%s:%s\n",
+		      itemType == 1 ? "CNAME" :
+		      itemType == 2 ? "NAME" :
+		      itemType == 3 ? "EMAIL" :
+		      itemType == 4 ? "PHONE" :
+		      itemType == 5 ? "LOC" :
+		      itemType == 6 ? "TOOL" :
+		      itemType == 7 ? "NOTE" :
+		      itemType == 8 ? "PRIV" :
+		      "(unknown)",
+		      itemType < 8 ? (char*)pkt // hack, because we know it's '\0'-terminated
+		      : "???"/* don't try to print out PRIV or unknown items */);
+	      ADVANCE(itemLen); length -= itemLen;
+
+	      itemType = *pkt; ADVANCE(1); --length;
+	    }
+	    if (itemType != 0) break; // bad 'SDES item'
+
+	    // Thus, itemType == 0.  This zero 'type' marks the end of the list of SDES items.
+	    // Skip over remaining zero padding bytes, so that this chunk ends on a 4-byte boundary:
+	    while (length%4 > 0 && *pkt == 0) { ADVANCE(1); --length; }
+	    if (length%4 > 0) break; // Bad (non-zero) padding byte
+
+	    chunkOK = True;
+	  }
+	  if (!chunkOK || length > 0) break; // bad chunk, or not enough bytes for the last chunk
 #endif
 	  subPacketOK = True;
 	  break;
+	}
+        case RTCP_PT_RTPFB: {
+#ifdef DEBUG
+	  fprintf(stderr, "RTPFB(unhandled)\n");
+#endif
+	  subPacketOK = True;
+	  break;
+	}
+        case RTCP_PT_PSFB: {
+#ifdef DEBUG
+	  fprintf(stderr, "PSFB(unhandled)\n");
+	  // Temporary code to show "Receiver Estimated Maximum Bitrate" (REMB) feedback reports:
+	  //#####
+	  if (length >= 12 && pkt[4] == 'R' && pkt[5] == 'E' && pkt[6] == 'M' && pkt[7] == 'B') {
+	    u_int8_t exp = pkt[9]>>2;
+	    u_int32_t mantissa = ((pkt[9]&0x03)<<16)|(pkt[10]<<8)|pkt[11];
+	    double remb = (double)mantissa;
+	    while (exp > 0) {
+	      remb *= 2.0;
+	      exp /= 2;
+	    }
+	    fprintf(stderr, "\tReceiver Estimated Max Bitrate (REMB): %g bps\n", remb);
+	  }
+#endif
+	  subPacketOK = True;
+	  break;
+	}
+        case RTCP_PT_XR: {
+#ifdef DEBUG
+	  fprintf(stderr, "XR(unhandled)\n");
+#endif
+	  subPacketOK = True;
+	  break;
+	}
+        case RTCP_PT_AVB: {
+#ifdef DEBUG
+	  fprintf(stderr, "AVB(unhandled)\n");
+#endif
+	  subPacketOK = True;
+	  break;
+	}
+        case RTCP_PT_RSI: {
+#ifdef DEBUG
+	  fprintf(stderr, "RSI(unhandled)\n");
+#endif
+	  subPacketOK = True;
+	  break;
+	}
+        case RTCP_PT_TOKEN: {
+#ifdef DEBUG
+	  fprintf(stderr, "TOKEN(unhandled)\n");
+#endif
+	  subPacketOK = True;
+	  break;
+	}
+        case RTCP_PT_IDMS: {
+#ifdef DEBUG
+	  fprintf(stderr, "IDMS(unhandled)\n");
+#endif
+	  subPacketOK = True;
+	  break;
+	}
+        default: {
+#ifdef DEBUG
+	  fprintf(stderr, "UNKNOWN TYPE(0x%x)\n", pt);
+#endif
+	  subPacketOK = True;
+	  break;
+	}
       }
       if (!subPacketOK) break;
 
       // need to check for (& handle) SSRC collision! #####
 
 #ifdef DEBUG
-      fprintf(stderr, "validated RTCP subpacket (type %d): %d, %d, %d, 0x%08x\n", typeOfPacket, rc, pt, length, reportSenderSSRC);
+      fprintf(stderr, "validated RTCP subpacket: rc:%d, pt:%d, bytes remaining:%d, report sender SSRC:0x%08x\n", rc, pt, length, reportSenderSSRC);
 #endif
 
       // Skip over any remaining bytes in this subpacket:
@@ -591,16 +880,22 @@ void RTCPInstance::incomingReportHandler1() {
     onReceive(typeOfPacket, totPacketSize, reportSenderSSRC);
 
     // Finally, if we need to call a "BYE" handler, do so now (in case it causes "this" to get deleted):
-    if (callByeHandler && fByeHandlerTask != NULL/*sanity check*/) {
-      TaskFunc* byeHandler = fByeHandlerTask;
-      fByeHandlerTask = NULL; // because we call the handler only once, by default
-      (*byeHandler)(fByeHandlerClientData);
+    if (callByeHandler) {
+      if (fByeHandlerTask != NULL) { // call a BYE handler without including a 'reason'
+	TaskFunc* byeHandler = fByeHandlerTask;
+	fByeHandlerTask = NULL; // because we call the handler only once, by default
+	(*byeHandler)(fByeHandlerClientData);
+      } else if (fByeWithReasonHandlerTask != NULL) { // call a BYE handler that includes a 'reason'
+	ByeWithReasonHandlerFunc* byeHandler = fByeWithReasonHandlerTask;
+	fByeWithReasonHandlerTask = NULL; // because we call the handler only once, by default
+	(*byeHandler)(fByeHandlerClientData, reason);
+	    // Note that the handler function is responsible for delete[]ing "reason"
+      }
     }
   } while (0);
 }
 
-void RTCPInstance::onReceive(int typeOfPacket, int totPacketSize,
-			     unsigned ssrc) {
+void RTCPInstance::onReceive(int typeOfPacket, int totPacketSize, u_int32_t ssrc) {
   fTypeOfPacket = typeOfPacket;
   fLastReceivedSize = totPacketSize;
   fLastReceivedSSRC = ssrc;
@@ -624,7 +919,7 @@ void RTCPInstance::sendReport() {
   fprintf(stderr, "sending REPORT\n");
 #endif
   // Begin by including a SR and/or RR report:
-  addReport();
+  if (!addReport()) return;
 
   // Then, include a SDES:
   addSDES();
@@ -640,14 +935,18 @@ void RTCPInstance::sendReport() {
   }
 }
 
-void RTCPInstance::sendBYE() {
+void RTCPInstance::sendBYE(char const* reason) {
 #ifdef DEBUG
-  fprintf(stderr, "sending BYE\n");
+  if (reason != NULL) {
+    fprintf(stderr, "sending BYE (reason:%s)\n", reason);
+  } else {
+    fprintf(stderr, "sending BYE\n");
+  }
 #endif
   // The packet must begin with a SR and/or RR report:
-  addReport();
+  (void)addReport(True);
 
-  addBYE();
+  addBYE(reason);
   sendBuiltPacket();
 }
 
@@ -662,6 +961,11 @@ void RTCPInstance::sendBuiltPacket() {
   fprintf(stderr, "\n");
 #endif
   unsigned reportSize = fOutBuf->curPacketSize();
+  if (fCrypto != NULL) { // Encrypt/tag the data before sending it:
+    unsigned newReportSize;
+    if (!fCrypto->processOutgoingSRTCPPacket(fOutBuf->packet(), reportSize, newReportSize)) return;
+    reportSize = newReportSize;
+  }
   fRTCPInterface.sendPacket(fOutBuf->packet(), reportSize);
   fOutBuf->resetOffset();
 
@@ -695,20 +999,29 @@ void RTCPInstance::onExpire(RTCPInstance* instance) {
 
 // Member functions to build specific kinds of report:
 
-void RTCPInstance::addReport() {
+Boolean RTCPInstance::addReport(Boolean alwaysAdd) {
   // Include a SR or a RR, depending on whether we have an associated sink or source:
   if (fSink != NULL) {
-    if (!fSink->enableRTCPReports()) return;
+    if (!alwaysAdd) {
+      if (!fSink->enableRTCPReports()) return False;
 
-    // Hack: Don't send a SR during those (brief) times when the timestamp of the
-    // next outgoing RTP packet has been preset, to ensure that that timestamp gets
-    // used for that outgoing packet. (David Bertrand, 2006.07.18)
-    if (fSink->nextTimestampHasBeenPreset()) return;
+      // Hack: Don't send a SR during those (brief) times when the timestamp of the
+      // next outgoing RTP packet has been preset, to ensure that that timestamp gets
+      // used for that outgoing packet. (David Bertrand, 2006.07.18)
+      if (fSink->nextTimestampHasBeenPreset()) return False;
+    }
 
     addSR();
-  } else if (fSource != NULL) {
+  }
+  if (fSource != NULL) {
+    if (!alwaysAdd) {
+      if (!fSource->enableRTCPReports()) return False;
+    }
+
     addRR();
   }
+
+  return True;
 }
 
 void RTCPInstance::addSR() {
@@ -745,7 +1058,7 @@ void RTCPInstance::addRR() {
 }
 
 void RTCPInstance::enqueueCommonReportPrefix(unsigned char packetType,
-					     unsigned SSRC,
+					     u_int32_t SSRC,
 					     unsigned numExtraWords) {
   unsigned numReportingSources;
   if (fSource == NULL) {
@@ -878,16 +1191,51 @@ void RTCPInstance::addSDES() {
   while (numPaddingBytesNeeded-- > 0) fOutBuf->enqueue(&zero, 1);
 }
 
-void RTCPInstance::addBYE() {
-  unsigned rtcpHdr = 0x81000000; // version 2, no padding, 1 SSRC
+void RTCPInstance::addBYE(char const* reason) {
+  u_int32_t rtcpHdr = 0x81000000; // version 2, no padding, 1 SSRC
   rtcpHdr |= (RTCP_PT_BYE<<16);
-  rtcpHdr |= 1; // 2 32-bit words total (i.e., with 1 SSRC)
+  u_int16_t num32BitWords = 2; // by default, two 32-bit words total (i.e., with 1 SSRC)
+  u_int8_t reasonLength8Bits = 0; // by default
+  if (reason != NULL) {
+    // We need to add more 32-bit words for the 'length+reason':
+    unsigned const reasonLength = strlen(reason);
+    reasonLength8Bits = reasonLength < 0xFF ? (u_int8_t)reasonLength : 0xFF;
+    unsigned numExtraWords = ((1/*reason length field*/+reasonLength8Bits)+3)/4;
+    
+    num32BitWords += numExtraWords;
+  }
+  rtcpHdr |= (num32BitWords-1); // length field
   fOutBuf->enqueueWord(rtcpHdr);
 
   if (fSource != NULL) {
     fOutBuf->enqueueWord(fSource->SSRC());
   } else if (fSink != NULL) {
     fOutBuf->enqueueWord(fSink->SSRC());
+  }
+
+  num32BitWords -= 2; // ASSERT: num32BitWords >= 0
+  if (num32BitWords > 0) {
+    // Add a length+'reason for leaving':
+    // First word:
+    u_int32_t lengthPlusFirst3ReasonBytes = reasonLength8Bits<<24;
+    unsigned index = 0;
+    if (reasonLength8Bits > index) lengthPlusFirst3ReasonBytes |= ((u_int8_t)reason[index++])<<16;
+    if (reasonLength8Bits > index) lengthPlusFirst3ReasonBytes |= ((u_int8_t)reason[index++])<<8;
+    if (reasonLength8Bits > index) lengthPlusFirst3ReasonBytes |= (u_int8_t)reason[index++];
+    fOutBuf->enqueueWord(lengthPlusFirst3ReasonBytes);
+
+    // Any subsequent words:
+    if (reasonLength8Bits > 3) {
+      // ASSERT: num32BitWords > 1
+      while (--num32BitWords > 0) {
+	u_int32_t fourMoreReasonBytes = 0;
+	if (reasonLength8Bits > index) fourMoreReasonBytes |= ((u_int8_t)reason[index++])<<24;
+	if (reasonLength8Bits > index) fourMoreReasonBytes |= ((u_int8_t)reason[index++])<<16;
+	if (reasonLength8Bits > index) fourMoreReasonBytes |= ((u_int8_t)reason[index++])<<8;
+	if (reasonLength8Bits > index) fourMoreReasonBytes |= (u_int8_t)reason[index++];
+	fOutBuf->enqueueWord(fourMoreReasonBytes);
+      }
+    }
   }
 }
 
@@ -910,6 +1258,8 @@ void RTCPInstance::reschedule(double nextTime) {
 }
 
 void RTCPInstance::onExpire1() {
+  nextTask() = NULL;
+
   // Note: fTotSessionBW is kbits per second
   double rtcpBW = 0.05*fTotSessionBW*1024/8; // -> bytes per second
 

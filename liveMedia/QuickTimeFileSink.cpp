@@ -1,7 +1,7 @@
 /**********
 This library is free software; you can redistribute it and/or modify it under
 the terms of the GNU Lesser General Public License as published by the
-Free Software Foundation; either version 2.1 of the License, or (at your
+Free Software Foundation; either version 3 of the License, or (at your
 option) any later version. (See <http://www.gnu.org/copyleft/lesser.html>.)
 
 This library is distributed in the hope that it will be useful, but WITHOUT
@@ -14,7 +14,7 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 **********/
 // "liveMedia"
-// Copyright (c) 1996-2012 Live Networks, Inc.  All rights reserved.
+// Copyright (c) 1996-2026 Live Networks, Inc.  All rights reserved.
 // A sink that generates a QuickTime file from a composite media session
 // Implementation
 
@@ -26,13 +26,15 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 #include "H263plusVideoRTPSource.hh" // for the special header
 #include "MPEG4GenericRTPSource.hh" //for "samplingFrequencyFromAudioSpecificConfig()"
 #include "MPEG4LATMAudioRTPSource.hh" // for "parseGeneralConfigStr()"
+#include "H264or5VideoStreamFramer.hh" // for "removeH264or5EmulationBytes()"
 #include "Base64.hh"
 
 #include <ctype.h>
 
 #define fourChar(x,y,z,w) ( ((x)<<24)|((y)<<16)|((z)<<8)|(w) )
 
-#define H264_IDR_FRAME 0x65  //bit 8 == 0, bits 7-6 (ref) == 3, bits 5-0 (type) == 5
+#define H264_IDR_FRAME 0x65  //bit 8 == 0, bits 7-6 (ref) == 3, bits 5-1 (type) == 5
+#define isIDRFrame(firstByte) (firstByte == H264_IDR_FRAME || ((firstByte&0x7E)>>1) == 19 || ((firstByte&0x7E)>>1) == 20)
 
 ////////// SubsessionIOState, ChunkDescriptor ///////////
 // A structure used to represent the I/O state of each input 'subsession':
@@ -42,7 +44,6 @@ public:
   ChunkDescriptor(int64_t offsetInFile, unsigned size,
 		  unsigned frameSize, unsigned frameDuration,
 		  struct timeval presentationTime);
-  virtual ~ChunkDescriptor();
 
   ChunkDescriptor* extendChunk(int64_t newOffsetInFile, unsigned newSize,
 			       unsigned newFrameSize,
@@ -89,7 +90,6 @@ private:
 class SyncFrame {
 public:
   SyncFrame(unsigned frameNum);
-  virtual ~SyncFrame();
 
 public:
   class SyncFrame *nextSyncFrame;
@@ -299,10 +299,10 @@ QuickTimeFileSink::QuickTimeFileSink(UsageEnvironment& env,
   }
 
   // Use the current time as the file's creation and modification
-  // time.  Use Apple's time format: seconds since January 1, 1904
+  // time.  Use Apple's time format: seconds (UTC) since January 1, 1904
 
   gettimeofday(&fStartTime, NULL);
-  fAppleCreationTime = fStartTime.tv_sec - 0x83dac000;
+  fAppleCreationTime = fStartTime.tv_sec - 0x83da4f80;
 
   // Begin by writing a "mdat" atom at the start of the file.
   // (Later, when we've finished copying data to the file, we'll come
@@ -316,10 +316,12 @@ QuickTimeFileSink::QuickTimeFileSink(UsageEnvironment& env,
 QuickTimeFileSink::~QuickTimeFileSink() {
   completeOutputFile();
 
-  // Then, delete each active "SubsessionIOState":
+  // Then, stop streaming and delete each active "SubsessionIOState":
   MediaSubsessionIterator iter(fInputSession);
   MediaSubsession* subsession;
   while ((subsession = iter.next()) != NULL) {
+    if (subsession->readSource() != NULL) subsession->readSource()->stopGettingFrames();
+
     SubsessionIOState* ioState
       = (SubsessionIOState*)(subsession->miscPtr);
     if (ioState == NULL) continue;
@@ -353,6 +355,12 @@ QuickTimeFileSink::createNew(UsageEnvironment& env,
   }
 
   return newSink;
+}
+
+void QuickTimeFileSink
+::noteRecordedFrame(MediaSubsession& /*inputSubsession*/,
+		    unsigned /*packetDataSize*/, struct timeval const& /*presentationTime*/) {
+  // Default implementation: Do nothing
 }
 
 Boolean QuickTimeFileSink::startPlaying(afterPlayingFunc* afterFunc,
@@ -549,7 +557,22 @@ SubsessionIOState::SubsessionIOState(QuickTimeFileSink& sink,
 
 SubsessionIOState::~SubsessionIOState() {
   delete fBuffer; delete fPrevBuffer;
-  delete fHeadChunk; delete fHeadSyncFrame;
+
+  // Delete the list of chunk descriptors:
+  ChunkDescriptor* chunk = fHeadChunk;
+  while (chunk != NULL) {
+    ChunkDescriptor* next = chunk->fNextChunk;
+    delete chunk;
+    chunk = next;
+  }
+
+  // Delete the list of sync frames:
+  SyncFrame* syncFrame = fHeadSyncFrame;
+  while (syncFrame != NULL) {
+    SyncFrame* next = syncFrame->nextSyncFrame;
+    delete syncFrame;
+    syncFrame = next;
+  }
 }
 
 Boolean SubsessionIOState::setQTstate() {
@@ -632,6 +655,10 @@ Boolean SubsessionIOState::setQTstate() {
 	fQTMediaDataAtomCreator = &QuickTimeFileSink::addAtom_avc1;
 	fQTTimeScale = 600;
 	fQTTimeUnitsPerSample = fQTTimeScale/fOurSink.fMovieFPS;
+      } else if (strcmp(fOurSubsession.codecName(), "H265") == 0) {
+	fQTMediaDataAtomCreator = &QuickTimeFileSink::addAtom_hvc1;
+	fQTTimeScale = 600;
+	fQTTimeUnitsPerSample = fQTTimeScale/fOurSink.fMovieFPS;
       } else if (strcmp(fOurSubsession.codecName(), "MP4V-ES") == 0) {
 	fQTMediaDataAtomCreator = &QuickTimeFileSink::addAtom_mp4v;
 	fQTTimeScale = 600;
@@ -690,18 +717,22 @@ void SubsessionIOState::afterGettingFrame(unsigned packetDataSize,
 					  struct timeval presentationTime) {
   // Begin by checking whether there was a gap in the RTP stream.
   // If so, try to compensate for this (if desired):
-  unsigned short rtpSeqNum
-    = fOurSubsession.rtpSource()->curPacketRTPSeqNum();
-  if (fOurSink.fPacketLossCompensate && fPrevBuffer->bytesInUse() > 0) {
-    short seqNumGap = rtpSeqNum - fLastPacketRTPSeqNum;
-    for (short i = 1; i < seqNumGap; ++i) {
-      // Insert a copy of the previous frame, to compensate for the loss:
-      useFrame(*fPrevBuffer);
+  if (fOurSubsession.rtpSource() != NULL) { // we have a RTP stream
+    unsigned short rtpSeqNum
+      = fOurSubsession.rtpSource()->curPacketRTPSeqNum();
+    if (fOurSink.fPacketLossCompensate && fPrevBuffer->bytesInUse() > 0) {
+      short seqNumGap = rtpSeqNum - fLastPacketRTPSeqNum;
+      for (short i = 1; i < seqNumGap; ++i) {
+	// Insert a copy of the previous frame, to compensate for the loss:
+	useFrame(*fPrevBuffer);
+      }
     }
+    fLastPacketRTPSeqNum = rtpSeqNum;
   }
-  fLastPacketRTPSeqNum = rtpSeqNum;
 
   // Now, continue working with the frame that we just got
+  fOurSink.noteRecordedFrame(fOurSubsession, packetDataSize, presentationTime);
+
   if (fBuffer->bytesInUse() == 0) {
     fBuffer->setPresentationTime(presentationTime);
   }
@@ -709,7 +740,8 @@ void SubsessionIOState::afterGettingFrame(unsigned packetDataSize,
 
   // If our RTP source is a "QuickTimeGenericRTPSource", then
   // use its 'qtState' to set some parameters that we need:
-  if (fQTMediaDataAtomCreator == &QuickTimeFileSink::addAtom_genericMedia){
+  if (fOurSubsession.rtpSource() != NULL // we have a RTP stream
+      && fQTMediaDataAtomCreator == &QuickTimeFileSink::addAtom_genericMedia) {
     QuickTimeGenericRTPSource* rtpSource
       = (QuickTimeGenericRTPSource*)fOurSubsession.rtpSource();
     QuickTimeGenericRTPSource::QTState& qtState = rtpSource->qtState;
@@ -775,7 +807,10 @@ void SubsessionIOState::useFrame(SubsessionBuffer& buffer) {
   struct timeval const& presentationTime = buffer.presentationTime();
   int64_t const destFileOffset = TellFile64(fOurSink.fOutFid);
   unsigned sampleNumberOfFrameStart = fQTTotNumSamples + 1;
-  Boolean avcHack = fQTMediaDataAtomCreator == &QuickTimeFileSink::addAtom_avc1;
+  Boolean h264or5Hack =
+    fQTMediaDataAtomCreator == &QuickTimeFileSink::addAtom_avc1 ||
+    fQTMediaDataAtomCreator == &QuickTimeFileSink::addAtom_hvc1;
+    
 
   // If we're not syncing streams, or this subsession is not video, then
   // just give this frame a fixed duration:
@@ -783,7 +818,7 @@ void SubsessionIOState::useFrame(SubsessionBuffer& buffer) {
       || fQTcomponentSubtype != fourChar('v','i','d','e')) {
     unsigned const frameDuration = fQTTimeUnitsPerSample*fQTSamplesPerFrame;
     unsigned frameSizeToUse = frameSize;
-    if (avcHack) frameSizeToUse += 4; // H.264/AVC gets the frame size prefix
+    if (h264or5Hack) frameSizeToUse += 4; // H.264/5 gets the frame size prefix
 
     fQTTotNumSamples += useFrame1(frameSizeToUse, presentationTime, frameDuration, destFileOffset);
   } else {
@@ -799,7 +834,7 @@ void SubsessionIOState::useFrame(SubsessionBuffer& buffer) {
       unsigned frameDuration
 	= (unsigned)((2*duration*fQTTimeScale+1)/2); // round
       unsigned frameSizeToUse = fPrevFrameState.frameSize;
-      if (avcHack) frameSizeToUse += 4; // H.264/AVC gets the frame size prefix
+      if (h264or5Hack) frameSizeToUse += 4; // H.264/5 gets the frame size prefix
 
       unsigned numSamples
 	= useFrame1(frameSizeToUse, ppt, frameDuration, fPrevFrameState.destFileOffset);
@@ -807,7 +842,7 @@ void SubsessionIOState::useFrame(SubsessionBuffer& buffer) {
       sampleNumberOfFrameStart = fQTTotNumSamples + 1;
     }
 
-    if (avcHack && (*frameSource == H264_IDR_FRAME)) {
+    if (h264or5Hack && isIDRFrame(*frameSource)) {
       SyncFrame* newSyncFrame = new SyncFrame(fQTTotNumSamples + 1);
       if (fTailSyncFrame == NULL) {
         fHeadSyncFrame = newSyncFrame;
@@ -823,18 +858,17 @@ void SubsessionIOState::useFrame(SubsessionBuffer& buffer) {
     fPrevFrameState.destFileOffset = destFileOffset;
   }
 
-  if (avcHack) fOurSink.addWord(frameSize);
+  if (h264or5Hack) fOurSink.addWord(frameSize);
 
   // Write the data into the file:
   fwrite(frameSource, 1, frameSize, fOurSink.fOutFid);
 
-  // If we have a hint track, then write to it also:
-  if (hasHintTrack()) {
+  // If we have a hint track, then write to it also (only if we have a RTP stream):
+  if (hasHintTrack() && fOurSubsession.rtpSource() != NULL) {
     // Because presentation times are used for RTP packet timestamps,
     // we don't starting writing to the hint track until we've been synced:
     if (!fHaveBeenSynced) {
-      fHaveBeenSynced
-	= fOurSubsession.rtpSource()->hasBeenSynchronizedUsingRTCP();
+      fHaveBeenSynced = fOurSubsession.rtpSource()->hasBeenSynchronizedUsingRTCP();
     }
     if (fHaveBeenSynced) {
       fHintTrackForUs->useFrameForHinting(frameSize, presentationTime,
@@ -861,7 +895,7 @@ void SubsessionIOState::useFrameForHinting(unsigned frameSize,
   // If there has been a previous frame, then output a 'hint sample' for it.
   // (We use the current frame's presentation time to compute the previous
   // hint sample's duration.)
-  RTPSource* const rs = fOurSubsession.rtpSource(); // abbrev
+  RTPSource* const rs = fOurSubsession.rtpSource(); // abbrev (ASSERT: != NULL)
   struct timeval const& ppt = fPrevFrameState.presentationTime; //abbrev
   if (ppt.tv_sec != 0 || ppt.tv_usec != 0) {
     double duration = (presentationTime.tv_sec - ppt.tv_sec)
@@ -1021,8 +1055,8 @@ void SubsessionIOState::useFrameForHinting(unsigned frameSize,
     }
   } else if (hackm4a_generic) {
     // Synthesize a special header, so that this frame can be in its own RTP packet.
-    unsigned const sizeLength = fOurSubsession.fmtp_sizelength();
-    unsigned const indexLength = fOurSubsession.fmtp_indexlength();
+    unsigned const sizeLength = fOurSubsession.attrVal_unsigned("sizelength");
+    unsigned const indexLength = fOurSubsession.attrVal_unsigned("indexlength");
     if (sizeLength + indexLength != 16) {
       envir() << "Warning: unexpected 'sizeLength' " << sizeLength
 	      << " and 'indexLength' " << indexLength
@@ -1079,7 +1113,7 @@ void SubsessionIOState::onSourceClosure() {
 
 Boolean SubsessionIOState::syncOK(struct timeval presentationTime) {
   QuickTimeFileSink& s = fOurSink; // abbreviation
-  if (!s.fSyncStreams) return True; // we don't care
+  if (!s.fSyncStreams || fOurSubsession.rtpSource() == NULL) return True; // we don't care
 
   if (s.fNumSyncedSubsessions < s.fNumSubsessions) {
     // Not all subsessions have yet been synced.  Check whether ours was
@@ -1094,7 +1128,7 @@ Boolean SubsessionIOState::syncOK(struct timeval presentationTime) {
 
 	  // if audio is in sync, wait for the next IDR frame to start
 	  unsigned char* const frameSource = fBuffer->dataStart();
-	  if (*frameSource != H264_IDR_FRAME) return False;
+	  if (!isIDRFrame(*frameSource)) return False;
 	}
 	// But now we are
 	fHaveBeenSynced = True;
@@ -1125,10 +1159,6 @@ SyncFrame::SyncFrame(unsigned frameNum)
   : nextSyncFrame(NULL), sfFrameNum(frameNum) {
 }  
 
-SyncFrame::~SyncFrame() {
-  delete nextSyncFrame;
-}
-
 void Count64::operator+=(unsigned arg) {
   unsigned newLo = lo + arg;
   if (newLo < lo) { // lo has overflowed
@@ -1145,10 +1175,6 @@ ChunkDescriptor
     fNumFrames(size/frameSize),
     fFrameSize(frameSize), fFrameDuration(frameDuration),
     fPresentationTime(presentationTime) {
-}
-
-ChunkDescriptor::~ChunkDescriptor() {
-  delete fNextChunk;
 }
 
 ChunkDescriptor* ChunkDescriptor
@@ -1283,7 +1309,7 @@ void QuickTimeFileSink::setWord64(int64_t filePosn, u_int64_t size) {
   } while (0);
 
   // One of the SeekFile64()s failed, probable because we're not a seekable file
-  envir() << "QuickTimeFileSink::setWord(): SeekFile64 failed (err "
+  envir() << "QuickTimeFileSink::setWord64(): SeekFile64 failed (err "
 	  << envir().getErrno() << ")\n";
 }
 
@@ -1660,10 +1686,13 @@ unsigned QuickTimeFileSink::addAtom_genericMedia() {
   // Use its "sdAtom" state for our contents:
   QuickTimeGenericRTPSource* rtpSource = (QuickTimeGenericRTPSource*)
     fCurrentIOState->fOurSubsession.rtpSource();
-  QuickTimeGenericRTPSource::QTState& qtState = rtpSource->qtState;
-  char const* from = qtState.sdAtom;
-  unsigned size = qtState.sdAtomSize;
-  for (unsigned i = 0; i < size; ++i) addByte(from[i]);
+  unsigned size = 0;
+  if (rtpSource != NULL) {
+    QuickTimeGenericRTPSource::QTState& qtState = rtpSource->qtState;
+    char const* from = qtState.sdAtom;
+    size = qtState.sdAtomSize;
+    for (unsigned i = 0; i < size; ++i) addByte(from[i]);
+  }
 addAtomEnd;
 
 unsigned QuickTimeFileSink::addAtom_soundMediaGeneral() {
@@ -1771,23 +1800,26 @@ unsigned QuickTimeFileSink::addAtom_mp4a() {
 addAtomEnd;
 
 addAtom(esds);
-  //#####
+  // Get the source's 'config' information.  (We need the size now.)
+  unsigned configSize;
   MediaSubsession& subsession = fCurrentIOState->fOurSubsession;
-  if (strcmp(subsession.mediumName(), "audio") == 0) {
-    // MPEG-4 audio
+  unsigned char* config
+    = parseGeneralConfigStr(subsession.fmtp_config(), configSize);
+
+  if (strcmp(subsession.mediumName(), "audio") == 0) { // MPEG-4 audio
     size += addWord(0x00000000); // ???
-    size += addWord(0x03808080); // ???
-    size += addWord(0x2a000000); // ???
-    size += addWord(0x04808080); // ???
-    size += addWord(0x1c401500); // ???
-    size += addWord(0x18000000); // ???
-    size += addWord(0x6d600000); // ???
-    size += addWord(0x6d600580); // ???
-    size += addByte(0x80); size += addByte(0x80); // ???
-  } else if (strcmp(subsession.mediumName(), "video") == 0) {
-    // MPEG-4 video
+    size += addWord(0x03808080); // ES_DescrTag+length coding
+    size += addWord((31+configSize)<<24); // length (includes 'config' and SLConfigDescriptor)
+        // DecoderConfigDescriptor
+        size += addWord(0x04808080); // DecoderConfigDescrTag + length coding
+	size += addWord(((17+configSize)<<24)|0x00401500); // length (includes 'config' info)
+	size += addWord(0x18000000); // ???
+	size += addWord(0x6d600000); // ???
+	size += addWord(0x6d600580); // ???
+	size += addByte(0x80); size += addByte(0x80); // ???
+  } else if (strcmp(subsession.mediumName(), "video") == 0) { // MPEG-4 video
     size += addWord(0x00000000); // ???
-    size += addWord(0x03330000); // ???
+    size += addWord(((22+configSize)<<16)|0x03000000); // ES_DescrTag + length (incl. 'config')
     size += addWord(0x1f042b20); // ???
     size += addWord(0x1104fd46); // ???
     size += addWord(0x000d4e10); // ???
@@ -1796,25 +1828,21 @@ addAtom(esds);
   }
 
   // Add the source's 'config' information:
-  unsigned configSize;
-  unsigned char* config
-    = parseGeneralConfigStr(subsession.fmtp_config(), configSize);
   size += addByte(configSize);
   for (unsigned i = 0; i < configSize; ++i) {
     size += addByte(config[i]);
   }
   delete[] config;
 
-  if (strcmp(subsession.mediumName(), "audio") == 0) {
-    // MPEG-4 audio
-    size += addWord(0x06808080); // ???
-    size += addHalfWord(0x0102); // ???
-  } else {
-    // MPEG-4 video
-    size += addHalfWord(0x0601); // ???
+  
+  // SLConfigDescriptor:
+  if (strcmp(subsession.mediumName(), "audio") == 0) { // MPEG-4 audio
+    size += addWord(0x06808080); // SLConfigDescrTag + length coding
+    size += addHalfWord(0x0102); // length(1) + ???
+  } else { // MPEG-4 video
+    size += addHalfWord(0x0601); // SLConfigDescrTag + length(1)
     size += addByte(0x02); // ???
   }
-  //#####
 addAtomEnd;
 
 addAtom(srcq);
@@ -1859,53 +1887,173 @@ addAtom(avc1);
   size += addWord(0x00480000); // Horizontal resolution
   size += addWord(0x00480000); // Vertical resolution
   size += addWord(0x00000000); // Data size
-  size += addWord(0x00010548); // Frame       count+Compressor name (start)
+  size += addWord(0x00010548); // Frame count+Compressor name (start)
     // "H.264"
   size += addWord(0x2e323634); // Compressor name (continued)
   size += addZeroWords(6); // Compressor name (continued - zero)
   size += addWord(0x00000018); // Compressor name (final)+Depth
-  size += addHalfWord(0xffff); // Color       table id
+  size += addHalfWord(0xffff); // Color table id
   size += addAtom_avcC();
 addAtomEnd;
 
 addAtom(avcC);
-// Begin by Base-64 decoding the "sprop" parameter sets strings:
+  // Begin by Base-64 decoding the "sprop" parameter sets strings:
   char* psets = strDup(fCurrentIOState->fOurSubsession.fmtp_spropparametersets());
   if (psets == NULL) return 0;
 
+  char const* spsBase64 = psets;
   size_t comma_pos = strcspn(psets, ",");
   psets[comma_pos] = '\0';
-  char const* sps_b64 = psets;
-  char const* pps_b64 = &psets[comma_pos+1];
-  unsigned sps_count;
-  unsigned char* sps_data = base64Decode(sps_b64, sps_count, false);
-  unsigned pps_count;
-  unsigned char* pps_data = base64Decode(pps_b64, pps_count, false);
 
-// Then add the decoded data:
+  char const* ppsBase64 = &psets[comma_pos+1];
+
+  unsigned spsSize;
+  unsigned char* sps = base64Decode(spsBase64, spsSize, false);
+
+  unsigned ppsSize;
+  unsigned char* pps = base64Decode(ppsBase64, ppsSize, false);
+
+  // We use some of the data from the "SPS". Remove any 'emulation bytes' from it first:
+  if (spsSize == 0) return 0;
+  u_int8_t* spsWEB = new u_int8_t[spsSize]; // "WEB" means "Without Emulation Bytes"
+  unsigned spsWEBSize = removeH264or5EmulationBytes(spsWEB, spsSize, sps, spsSize);
+  if (spsWEBSize < 4) { // Bad SPS size
+    delete[] spsWEB;
+    return 0;
+  }
+
+  // Then add the decoded data:
   size += addByte(0x01); // configuration version
-  size += addByte(sps_data[1]); // profile
-  size += addByte(sps_data[2]); // profile compat
-  size += addByte(sps_data[3]); // level
+  size += addByte(spsWEB[1]); // profile
+  size += addByte(spsWEB[2]); // profile compat
+  size += addByte(spsWEB[3]); // level
   size += addByte(0xff); /* 0b11111100 | lengthsize = 0x11 */
-  size += addByte(0xe0 | (sps_count > 0 ? 1 : 0) );
-  if (sps_count > 0) {
-    size += addHalfWord(sps_count);
-    for (unsigned i = 0; i < sps_count; i++) {
-      size += addByte(sps_data[i]);
+  size += addByte(0xe0 | (spsSize > 0 ? 1 : 0) );
+  if (spsSize > 0) {
+    size += addHalfWord(spsSize);
+    for (unsigned i = 0; i < spsSize; i++) {
+      size += addByte(sps[i]);
     }
   }
-  size += addByte(pps_count > 0 ? 1 : 0);
-  if (pps_count > 0) {
-    size += addHalfWord(pps_count);
-    for (unsigned i = 0; i < pps_count; i++) {
-      size += addByte(pps_data[i]);
+  size += addByte(ppsSize > 0 ? 1 : 0);
+  if (ppsSize > 0) {
+    size += addHalfWord(ppsSize);
+    for (unsigned i = 0; i < ppsSize; i++) {
+      size += addByte(pps[i]);
+    }
+  }
+
+  // Finally, delete the data that we allocated:
+  delete[] spsWEB;
+  delete[] pps; delete[] sps;
+  delete[] psets;
+addAtomEnd;
+
+addAtom(hvc1);
+// General sample description fields:
+  size += addWord(0x00000000); // Reserved
+  size += addWord(0x00000001); // Reserved+Data       reference index
+// Video sample       description     fields:
+  size += addWord(0x00000000); // Version+Revision level
+  size += add4ByteString("appl"); // Vendor
+  size += addWord(0x00000000); // Temporal quality
+  size += addWord(0x00000000); // Spatial quality
+  unsigned const widthAndHeight       = (fMovieWidth<<16)|fMovieHeight;
+  size += addWord(widthAndHeight); // Width+height
+  size += addWord(0x00480000); // Horizontal resolution
+  size += addWord(0x00480000); // Vertical resolution
+  size += addWord(0x00000000); // Data size
+  size += addWord(0x00010548); // Frame count+Compressor name (start)
+    // "H.265"
+  size += addWord(0x2e323635); // Compressor name (continued)
+  size += addZeroWords(6); // Compressor name (continued - zero)
+  size += addWord(0x00000018); // Compressor name (final)+Depth
+  size += addHalfWord(0xffff); // Color table id
+  size += addAtom_hvcC();
+addAtomEnd;
+
+addAtom(hvcC);
+  // Begin by Base-64 decoding the "sprop" parameter sets strings:
+  char const* vpsBase64 = strDup(fCurrentIOState->fOurSubsession.fmtp_spropvps());
+  char const* spsBase64 = strDup(fCurrentIOState->fOurSubsession.fmtp_spropsps());
+  char const* ppsBase64 = strDup(fCurrentIOState->fOurSubsession.fmtp_sproppps());
+  if (vpsBase64 == NULL || spsBase64 == NULL || ppsBase64 == NULL) return 0;
+
+  unsigned vpsSize;
+  unsigned char* vps = base64Decode(vpsBase64, vpsSize, false);
+
+  unsigned spsSize;
+  unsigned char* sps = base64Decode(spsBase64, spsSize, false);
+
+  unsigned ppsSize;
+  unsigned char* pps = base64Decode(ppsBase64, ppsSize, false);
+
+  // We use some of the data from the "VPS". Remove any 'emulation bytes' from it first:
+  if (vpsSize == 0) return 0;
+  u_int8_t* vpsWEB = new u_int8_t[vpsSize]; // "WEB" means "Without Emulation Bytes"
+  unsigned vpsWEBSize = removeH264or5EmulationBytes(vpsWEB, vpsSize, vps, vpsSize);
+  if (vpsWEBSize < 6/*'profile_tier_level' offset*/ + 12/*num 'profile_tier_level' bytes*/) {
+    // Bad VPS size
+    delete[] vpsWEB;
+    return 0;
+  }
+
+  // Then add the decoded data:
+  size += addByte(0x01); // configurationVersion = 1
+
+  u_int8_t const* profileTierLevelHeaderBytes = &vpsWEB[6];
+  size += addByte(profileTierLevelHeaderBytes[0]);
+      // general_profile_space + general_tier_flag + general_profile_idc
+
+  u_int8_t const* general_profile_compatibility_flags = &profileTierLevelHeaderBytes[1];
+  for (unsigned i = 0; i < 4; ++i) size += addByte(general_profile_compatibility_flags[i]);
+      // general_profile_compatibility_flags
+
+  u_int8_t const* general_constraint_indicator_flags = &profileTierLevelHeaderBytes[5];
+  for (unsigned i = 0; i < 6; ++i) size += addByte(general_constraint_indicator_flags[i]);
+      // general_constraint_indicator_flags
+
+  size += addByte(profileTierLevelHeaderBytes[11]); // general_level_idc
+  size += addHalfWord(0xF000); // min_spatial_segmentation_idc = 0 ???
+  size += addByte(0xFC); // parallelismType = 0 ???
+  size += addByte(0xFD); // chroma_format_idc = 1 ???
+  size += addByte(0xF8); // bit_depth_luma_minus8 = 0 ???
+  size += addByte(0xF8); // bit_depth_chroma_minus8 = 0 ???
+  size += addHalfWord(0x0000); // avgFrameRate = 0
+  size += addByte(0x0F);
+      // constantFrameRate = 0; numTemporalLayers = 1; temporalIdNested = 1; lengthSizeMinusOne = 3 ???
+  size += addByte(1 + (spsSize > 0) + (ppsSize > 0)); // numOfArrays
+
+  if (vpsSize > 0) {
+    size += addByte(0x20); // array_completeness = 0; NAL_unit_type = VPS
+    size += addHalfWord(1); // numNalus
+    size += addHalfWord(vpsSize);
+    for (unsigned i = 0; i < vpsSize; i++) {
+      size += addByte(vps[i]);
+    }
+  }
+
+  if (spsSize > 0) {
+    size += addByte(0x21); // array_completeness = 0; NAL_unit_type = SPS
+    size += addHalfWord(1); // numNalus
+    size += addHalfWord(spsSize);
+    for (unsigned i = 0; i < spsSize; i++) {
+      size += addByte(sps[i]);
+    }
+  }
+
+  if (ppsSize > 0) {
+    size += addByte(0x22); // array_completeness = 0; NAL_unit_type = PPS
+    size += addHalfWord(1); // numNalus
+    size += addHalfWord(ppsSize);
+    for (unsigned i = 0; i < ppsSize; i++) {
+      size += addByte(pps[i]);
     }
   }
 
 // Finally, delete the data that we allocated:
-  delete[] pps_data; delete[] sps_data;
-  delete[] psets;
+  delete[] vpsWEB;
+  delete[] vps; delete[] pps; delete[] sps;
 addAtomEnd;
 
 addAtom(mp4v);
@@ -2003,13 +2151,20 @@ addAtom(stss); // Sync-Sample
   unsigned numEntries = 0, numSamplesSoFar = 0;
   if (fCurrentIOState->fHeadSyncFrame != NULL) {
     SyncFrame* currentSyncFrame = fCurrentIOState->fHeadSyncFrame;
-    while(currentSyncFrame != NULL) {
+
+    // First, count the number of frames (to use as a sanity check; see below):
+    unsigned totNumFrames = 0;
+    for (ChunkDescriptor* chunk = fCurrentIOState->fHeadChunk; chunk != NULL; chunk = chunk->fNextChunk) totNumFrames += chunk->fNumFrames;
+
+    while (currentSyncFrame != NULL) {
+      if (currentSyncFrame->sfFrameNum >= totNumFrames) break; // sanity check
+      
       ++numEntries;
       size += addWord(currentSyncFrame->sfFrameNum);
       currentSyncFrame = currentSyncFrame->nextSyncFrame;
     }
   } else {
-    // Then, run through the chunk descriptors, counting up the total nuber of samples:
+    // First, run through the chunk descriptors, counting up the total number of samples:
     unsigned const samplesPerFrame = fCurrentIOState->fQTSamplesPerFrame;
     ChunkDescriptor* chunk = fCurrentIOState->fHeadChunk;
     while (chunk != NULL) {
@@ -2292,15 +2447,17 @@ addAtomEnd;
 addAtom(payt);
   MediaSubsession& ourSubsession = fCurrentIOState->fOurSubsession;
   RTPSource* rtpSource = ourSubsession.rtpSource();
-  size += addWord(rtpSource->rtpPayloadFormat());
+  if (rtpSource != NULL) {
+    size += addWord(rtpSource->rtpPayloadFormat());
 
-  // Also, add a 'rtpmap' string: <mime-subtype>/<rtp-frequency>
-  unsigned rtpmapStringLength = strlen(ourSubsession.codecName()) + 20;
-  char* rtpmapString = new char[rtpmapStringLength];
-  sprintf(rtpmapString, "%s/%d",
-	  ourSubsession.codecName(), rtpSource->timestampFrequency());
-  size += addArbitraryString(rtpmapString);
-  delete[] rtpmapString;
+    // Also, add a 'rtpmap' string: <mime-subtype>/<rtp-frequency>
+    unsigned rtpmapStringLength = strlen(ourSubsession.codecName()) + 20;
+    char* rtpmapString = new char[rtpmapStringLength];
+    sprintf(rtpmapString, "%s/%d",
+	    ourSubsession.codecName(), rtpSource->timestampFrequency());
+    size += addArbitraryString(rtpmapString);
+    delete[] rtpmapString;
+  }
 addAtomEnd;
 
 // A dummy atom (with name "????"):

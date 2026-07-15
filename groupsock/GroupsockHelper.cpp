@@ -1,7 +1,7 @@
 /**********
 This library is free software; you can redistribute it and/or modify it under
 the terms of the GNU Lesser General Public License as published by the
-Free Software Foundation; either version 2.1 of the License, or (at your
+Free Software Foundation; either version 3 of the License, or (at your
 option) any later version. (See <http://www.gnu.org/copyleft/lesser.html>.)
 
 This library is distributed in the hope that it will be useful, but WITHOUT
@@ -13,27 +13,48 @@ You should have received a copy of the GNU Lesser General Public License
 along with this library; if not, write to the Free Software Foundation, Inc.,
 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 **********/
-// "mTunnel" multicast access service
-// Copyright (c) 1996-2012 Live Networks, Inc.  All rights reserved.
+// "groupsock"
+// Copyright (c) 1996-2026 Live Networks, Inc.  All rights reserved.
 // Helper routines to implement 'group sockets'
 // Implementation
 
 #include "GroupsockHelper.hh"
 
-#if defined(__WIN32__) || defined(_WIN32)
+#if (defined(__WIN32__) || defined(_WIN32)) && !defined(__MINGW32__)
 #include <time.h>
 extern "C" int initializeWinsockIfNecessary();
 #else
 #include <stdarg.h>
 #include <time.h>
+#include <sys/time.h>
+#if !defined(_WIN32)
+#include <netinet/tcp.h>
+#ifdef __ANDROID_NDK__
+#include <android/ndk-version.h>
+#define ANDROID_OLD_NDK __NDK_MAJOR__ < 17
+#endif
+#endif
 #include <fcntl.h>
 #define initializeWinsockIfNecessary() 1
 #endif
+#if defined(__WIN32__) || defined(_WIN32) || defined(_QNX4)
+#else
+#include <signal.h>
+#define USE_SIGNALS 1
+#endif
+#ifndef NO_GETIFADDRS
+#include <ifaddrs.h>
+#include <net/if.h>
+#endif
 #include <stdio.h>
 
-// By default, use INADDR_ANY for the sending and receiving interfaces:
-netAddressBits SendingInterfaceAddr = INADDR_ANY;
-netAddressBits ReceivingInterfaceAddr = INADDR_ANY;
+// By default, use INADDR_ANY for the sending and receiving interfaces (IPv4 only):
+ipv4AddressBits SendingInterfaceAddr = INADDR_ANY;
+ipv4AddressBits ReceivingInterfaceAddr = INADDR_ANY;
+in6_addr ReceivingInterfaceAddr6 = IN6ADDR_ANY_INIT;
+#ifdef SO_BINDTODEVICE
+char InterfaceBindToDevice[128] = {0};
+#endif
 
 static void socketErr(UsageEnvironment& env, char const* errorMsg) {
   env.setResultErrMsg(errorMsg);
@@ -69,35 +90,48 @@ void reclaimGroupsockPriv(UsageEnvironment& env) {
   }
 }
 
-static int createSocket(int type) {
-  // Call "socket()" to create a (IPv4) socket of the specified type.
+static int createSocket(int domain, int type) {
+  // Call "socket()" to create a socket of the specified type.
   // But also set it to have the 'close on exec' property (if we can)
   int sock;
 
+  // In case PF_INET(6) is not defined to be AF_INET(6):
+  int const domain2 = domain == AF_INET ? PF_INET : domain == AF_INET6 ? PF_INET6 : domain;
+
 #ifdef SOCK_CLOEXEC
-  sock = socket(AF_INET, type|SOCK_CLOEXEC, 0);
+  sock = socket(domain2, type|SOCK_CLOEXEC, 0);
   if (sock != -1 || errno != EINVAL) return sock;
   // An "errno" of EINVAL likely means that the system wasn't happy with the SOCK_CLOEXEC; fall through and try again without it:
 #endif
 
-  sock = socket(AF_INET, type, 0);
+  sock = socket(domain2, type, 0);
 #ifdef FD_CLOEXEC
   if (sock != -1) fcntl(sock, F_SETFD, FD_CLOEXEC);
 #endif
   return sock;
 }
 
-int setupDatagramSocket(UsageEnvironment& env, Port port) {
+int setupDatagramSocket(UsageEnvironment& env, Port port, int domain) {
   if (!initializeWinsockIfNecessary()) {
     socketErr(env, "Failed to initialize 'winsock': ");
     return -1;
   }
 
-  int newSocket = createSocket(SOCK_DGRAM);
+  int newSocket = createSocket(domain, SOCK_DGRAM);
   if (newSocket < 0) {
     socketErr(env, "unable to create datagram socket: ");
     return newSocket;
   }
+
+#ifdef SO_BINDTODEVICE
+  if (InterfaceBindToDevice[0] != '\0') {
+    if (setsockopt(newSocket, SOL_SOCKET, SO_BINDTODEVICE, InterfaceBindToDevice, strlen(InterfaceBindToDevice)) < 0) {
+      socketErr(env, "setsockopt(SO_BINDTODEVICE) error: ");
+      closeSocket(newSocket);
+      return -1;
+    }
+  }
+#endif
 
   int reuseFlag = groupsockPriv(env)->reuseFlag;
   reclaimGroupsockPriv(env);
@@ -122,42 +156,66 @@ int setupDatagramSocket(UsageEnvironment& env, Port port) {
 
 #ifdef IP_MULTICAST_LOOP
   const u_int8_t loop = 1;
-  if (setsockopt(newSocket, IPPROTO_IP, IP_MULTICAST_LOOP,
+  if (setsockopt(newSocket,
+		 domain == AF_INET ? IPPROTO_IP : IPPROTO_IPV6,
+		 domain == AF_INET ? IP_MULTICAST_LOOP : IPV6_MULTICAST_LOOP,
 		 (const char*)&loop, sizeof loop) < 0) {
-    socketErr(env, "setsockopt(IP_MULTICAST_LOOP) error: ");
-    closeSocket(newSocket);
-    return -1;
-  }
-#endif
-#endif
-
-  // Note: Windoze requires binding, even if the port number is 0
-  netAddressBits addr = INADDR_ANY;
-#if defined(__WIN32__) || defined(_WIN32)
-#else
-  if (port.num() != 0 || ReceivingInterfaceAddr != INADDR_ANY) {
-#endif
-    if (port.num() == 0) addr = ReceivingInterfaceAddr;
-    MAKE_SOCKADDR_IN(name, addr, port.num());
-    if (bind(newSocket, (struct sockaddr*)&name, sizeof name) != 0) {
-      char tmpBuffer[100];
-      sprintf(tmpBuffer, "bind() error (port number: %d): ",
-	      ntohs(port.num()));
-      socketErr(env, tmpBuffer);
+    if (domain == AF_INET) { // For some unknown reason, this might not work for IPv6
+      socketErr(env, "setsockopt(IP_MULTICAST_LOOP) error: ");
       closeSocket(newSocket);
       return -1;
     }
-#if defined(__WIN32__) || defined(_WIN32)
-#else
   }
 #endif
+#endif
+
+  if (domain == AF_INET) {
+    // Note: Windoze requires binding, even if the port number is 0
+    ipv4AddressBits addr = INADDR_ANY;
+#if defined(__WIN32__) || defined(_WIN32)
+#else
+    if (port.num() != 0 || ReceivingInterfaceAddr != INADDR_ANY) {
+#endif
+      if (port.num() == 0) addr = ReceivingInterfaceAddr;
+      MAKE_SOCKADDR_IN(name, addr, port.num());
+      if (bind(newSocket, (struct sockaddr*)&name, sizeof name) != 0) {
+	char tmpBuffer[100];
+	sprintf(tmpBuffer, "IPv4 bind() error (port number: %d): ", ntohs(port.num()));
+	socketErr(env, tmpBuffer);
+	closeSocket(newSocket);
+	return -1;
+      }
+#if defined(__WIN32__) || defined(_WIN32)
+#else
+    }
+#endif
+  } else { // IPv6
+    in6_addr addr = IN6ADDR_ANY_INIT;
+    if (port.num() != 0) {
+      // For IPv6 sockets, we need the IPV6_V6ONLY flag set to 1, otherwise we would not
+      // be able to have an IPv4 socket and an IPv6 socket bound to the same port:
+      int const one = 1;
+      (void)setsockopt(newSocket, IPPROTO_IPV6, IPV6_V6ONLY, (const char*)&one, sizeof one);
+
+      MAKE_SOCKADDR_IN6(name, addr, port.num());
+      if (bind(newSocket, (struct sockaddr*)&name, sizeof name) != 0) {
+	char tmpBuffer[100];
+	sprintf(tmpBuffer, "IPv6 bind() error (port number: %d): ", ntohs(port.num()));
+	socketErr(env, tmpBuffer);
+	closeSocket(newSocket);
+	return -1;
+      }
+    }
+  }
 
   // Set the sending interface for multicasts, if it's not the default:
-  if (SendingInterfaceAddr != INADDR_ANY) {
+  if (SendingInterfaceAddr != INADDR_ANY) { // later, fix for IPv6
     struct in_addr addr;
     addr.s_addr = SendingInterfaceAddr;
 
-    if (setsockopt(newSocket, IPPROTO_IP, IP_MULTICAST_IF,
+    if (setsockopt(newSocket,
+		   domain == AF_INET ? IPPROTO_IP : IPPROTO_IPV6,
+		   domain == AF_INET ? IP_MULTICAST_IF : IPV6_MULTICAST_IF,
 		   (const char*)&addr, sizeof addr) < 0) {
       socketErr(env, "error setting outgoing multicast interface: ");
       closeSocket(newSocket);
@@ -181,31 +239,92 @@ Boolean makeSocketNonBlocking(int sock) {
 #endif
 }
 
-Boolean makeSocketBlocking(int sock) {
+Boolean makeSocketBlocking(int sock, unsigned writeTimeoutInMilliseconds) {
+  Boolean result;
 #if defined(__WIN32__) || defined(_WIN32)
   unsigned long arg = 0;
-  return ioctlsocket(sock, FIONBIO, &arg) == 0;
+  result = ioctlsocket(sock, FIONBIO, &arg) == 0;
 #elif defined(VXWORKS)
   int arg = 0;
-  return ioctl(sock, FIONBIO, (int)&arg) == 0;
+  result = ioctl(sock, FIONBIO, (int)&arg) == 0;
 #else
   int curFlags = fcntl(sock, F_GETFL, 0);
-  return fcntl(sock, F_SETFL, curFlags&(~O_NONBLOCK)) >= 0;
+  result = fcntl(sock, F_SETFL, curFlags&(~O_NONBLOCK)) >= 0;
 #endif
+
+  if (writeTimeoutInMilliseconds > 0) {
+#ifdef SO_SNDTIMEO
+#if defined(__WIN32__) || defined(_WIN32)
+    DWORD msto = (DWORD)writeTimeoutInMilliseconds;
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (char *)&msto, sizeof(msto) );
+#else
+    struct timeval tv;
+    tv.tv_sec = writeTimeoutInMilliseconds/1000;
+    tv.tv_usec = (writeTimeoutInMilliseconds%1000)*1000;
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (char *)&tv, sizeof tv);
+#endif
+#endif
+  }
+
+  return result;
 }
 
-int setupStreamSocket(UsageEnvironment& env,
-                      Port port, Boolean makeNonBlocking) {
+Boolean setSocketKeepAlive(int sock) {
+#if defined(__WIN32__) || defined(_WIN32)
+  // How do we do this in Windows?  For now, just make this a no-op in Windows:
+#else
+  int const keepalive_enabled = 1;
+  if (setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, (void*)&keepalive_enabled, sizeof keepalive_enabled) < 0) {
+    return False;
+  }
+
+#ifdef TCP_KEEPIDLE
+  int const keepalive_time = 180;
+  if (setsockopt(sock, IPPROTO_TCP, TCP_KEEPIDLE, (void*)&keepalive_time, sizeof keepalive_time) < 0) {
+    return False;
+  }
+#endif
+
+#ifdef TCP_KEEPCNT
+  int const keepalive_count = 5;
+  if (setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT, (void*)&keepalive_count, sizeof keepalive_count) < 0) {
+    return False;
+  }
+#endif
+
+#ifdef TCP_KEEPINTVL
+  int const keepalive_interval = 20;
+  if (setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, (void*)&keepalive_interval, sizeof keepalive_interval) < 0) {
+    return False;
+  }
+#endif
+#endif
+
+  return True;
+}
+
+int setupStreamSocket(UsageEnvironment& env, Port port, int domain,
+		      Boolean makeNonBlocking, Boolean setKeepAlive) {
   if (!initializeWinsockIfNecessary()) {
     socketErr(env, "Failed to initialize 'winsock': ");
     return -1;
   }
 
-  int newSocket = createSocket(SOCK_STREAM);
+  int newSocket = createSocket(domain, SOCK_STREAM);
   if (newSocket < 0) {
     socketErr(env, "unable to create stream socket: ");
     return newSocket;
   }
+
+#ifdef SO_BINDTODEVICE
+  if (InterfaceBindToDevice[0] != '\0') {
+    if (setsockopt(newSocket, SOL_SOCKET, SO_BINDTODEVICE, InterfaceBindToDevice, strlen(InterfaceBindToDevice)) < 0) {
+      socketErr(env, "setsockopt(SO_BINDTODEVICE) error: ");
+      closeSocket(newSocket);
+      return -1;
+    }
+  }
+#endif
 
   int reuseFlag = groupsockPriv(env)->reuseFlag;
   reclaimGroupsockPriv(env);
@@ -234,28 +353,55 @@ int setupStreamSocket(UsageEnvironment& env,
 #endif
 #endif
 
-  // Note: Windoze requires binding, even if the port number is 0
+  if (domain == AF_INET) {
+    // Note: Windoze requires binding, even if the port number is 0
 #if defined(__WIN32__) || defined(_WIN32)
 #else
-  if (port.num() != 0 || ReceivingInterfaceAddr != INADDR_ANY) {
+    if (port.num() != 0 || ReceivingInterfaceAddr != INADDR_ANY) {
 #endif
-    MAKE_SOCKADDR_IN(name, ReceivingInterfaceAddr, port.num());
-    if (bind(newSocket, (struct sockaddr*)&name, sizeof name) != 0) {
-      char tmpBuffer[100];
-      sprintf(tmpBuffer, "bind() error (port number: %d): ",
-	      ntohs(port.num()));
-      socketErr(env, tmpBuffer);
-      closeSocket(newSocket);
-      return -1;
+      MAKE_SOCKADDR_IN(name, ReceivingInterfaceAddr, port.num());
+      if (bind(newSocket, (struct sockaddr*)&name, sizeof name) != 0) {
+	char tmpBuffer[100];
+	sprintf(tmpBuffer, "IPv4 bind() error (port number: %d): ", ntohs(port.num()));
+	socketErr(env, tmpBuffer);
+	closeSocket(newSocket);
+	return -1;
+      }
+#if defined(__WIN32__) || defined(_WIN32)
+#else
     }
-#if defined(__WIN32__) || defined(_WIN32)
-#else
-  }
 #endif
+  } else { // IPv6
+    if (port.num() != 0) {
+      // For IPv6 sockets, we need the IPV6_V6ONLY flag set to 1, otherwise we would not
+      // be able to have an IPv4 socket and an IPv6 socket bound to the same port:
+      int const one = 1;
+      (void)setsockopt(newSocket, IPPROTO_IPV6, IPV6_V6ONLY, (const char*)&one, sizeof one);
+
+      MAKE_SOCKADDR_IN6(name, ReceivingInterfaceAddr6, port.num());
+      if (bind(newSocket, (struct sockaddr*)&name, sizeof name) != 0) {
+	char tmpBuffer[100];
+	sprintf(tmpBuffer, "IPv6 bind() error (port number: %d): ", ntohs(port.num()));
+	socketErr(env, tmpBuffer);
+	closeSocket(newSocket);
+	return -1;
+      }
+    }
+  }
 
   if (makeNonBlocking) {
     if (!makeSocketNonBlocking(newSocket)) {
       socketErr(env, "failed to make non-blocking: ");
+      closeSocket(newSocket);
+      return -1;
+    }
+  }
+
+  // Set the keep alive mechanism for the TCP socket, to avoid "ghost sockets" 
+  //    that remain after an interrupted communication.
+  if (setKeepAlive) {
+    if (!setSocketKeepAlive(newSocket)) {
+      socketErr(env, "failed to set keep alive: ");
       closeSocket(newSocket);
       return -1;
     }
@@ -266,7 +412,7 @@ int setupStreamSocket(UsageEnvironment& env,
 
 int readSocket(UsageEnvironment& env,
 	       int socket, unsigned char* buffer, unsigned bufferSize,
-	       struct sockaddr_in& fromAddress) {
+	       struct sockaddr_storage& fromAddress) {
   SOCKLEN_T addressSize = sizeof fromAddress;
   int bytesRead = recvfrom(socket, (char*)buffer, bufferSize, 0,
 			   (struct sockaddr*)&fromAddress,
@@ -287,7 +433,6 @@ int readSocket(UsageEnvironment& env,
 	|| err == EAGAIN
 #endif
 	|| err == 113 /*EHOSTUNREACH (Linux)*/) { // Why does Linux return this for datagram sock?
-      fromAddress.sin_addr.s_addr = 0;
       return 0;
     }
     //##### END HACK
@@ -301,39 +446,56 @@ int readSocket(UsageEnvironment& env,
 }
 
 Boolean writeSocket(UsageEnvironment& env,
-		    int socket, struct in_addr address, Port port,
+		    int socket, struct sockaddr_storage const& addressAndPort,
 		    u_int8_t ttlArg,
 		    unsigned char* buffer, unsigned bufferSize) {
-	do {
-		if (ttlArg != 0) {
-			// Before sending, set the socket's TTL:
+  // Before sending, set the socket's TTL (IPv4 only):
+  if (addressAndPort.ss_family == AF_INET) {
 #if defined(__WIN32__) || defined(_WIN32)
 #define TTL_TYPE int
 #else
 #define TTL_TYPE u_int8_t
 #endif
-			TTL_TYPE ttl = (TTL_TYPE)ttlArg;
-			if (setsockopt(socket, IPPROTO_IP, IP_MULTICAST_TTL,
-				       (const char*)&ttl, sizeof ttl) < 0) {
-				socketErr(env, "setsockopt(IP_MULTICAST_TTL) error: ");
-				break;
-			}
-		}
+    TTL_TYPE ttl = (TTL_TYPE)ttlArg;
+    if (setsockopt(socket, IPPROTO_IP, IP_MULTICAST_TTL,
+		   (const char*)&ttl, sizeof ttl) < 0) {
+      socketErr(env, "setsockopt(IP_MULTICAST_TTL) error: ");
+      return False;
+    }
+  }
+  
+  return writeSocket(env, socket, addressAndPort, buffer, bufferSize);
+}
 
-		MAKE_SOCKADDR_IN(dest, address.s_addr, port.num());
-		int bytesSent = sendto(socket, (char*)buffer, bufferSize, 0,
-			               (struct sockaddr*)&dest, sizeof dest);
-		if (bytesSent != (int)bufferSize) {
-			char tmpBuf[100];
-			sprintf(tmpBuf, "writeSocket(%d), sendTo() error: wrote %d bytes instead of %u: ", socket, bytesSent, bufferSize);
-			socketErr(env, tmpBuf);
-			break;
-		}
+Boolean writeSocket(UsageEnvironment& env,
+		    int socket, struct sockaddr_storage const& addressAndPort,
+		    unsigned char* buffer, unsigned bufferSize) {
+  do {
+    SOCKLEN_T dest_len = addressSize(addressAndPort);
+    int bytesSent = sendto(socket, (char*)buffer, bufferSize, MSG_NOSIGNAL,
+			   (struct sockaddr const*)&addressAndPort, dest_len);
+    if (bytesSent != (int)bufferSize) {
+      char tmpBuf[100];
+      sprintf(tmpBuf, "writeSocket(%d), sendTo() error: wrote %d bytes instead of %u: ", socket, bytesSent, bufferSize);
+      socketErr(env, tmpBuf);
+      break;
+    }
+    
+    return True;
+  } while (0);
 
-		return True;
-	} while (0);
+  return False;
+}
 
-	return False;
+void ignoreSigPipeOnSocket(int socketNum) {
+  #ifdef USE_SIGNALS
+  #ifdef SO_NOSIGPIPE
+  int set_option = 1;
+  setsockopt(socketNum, SOL_SOCKET, SO_NOSIGPIPE, &set_option, sizeof set_option);
+  #else
+  signal(SIGPIPE, SIG_IGN);
+  #endif
+  #endif
 }
 
 static unsigned getBufferSize(UsageEnvironment& env, int bufOptName,
@@ -401,15 +563,56 @@ unsigned increaseReceiveBufferTo(UsageEnvironment& env,
   return increaseBufferTo(env, SO_RCVBUF, socket, requestedSize);
 }
 
+static void clearMulticastAllSocketOption(int socket, int domain) {
+#ifdef IP_MULTICAST_ALL
+  // This option is defined in modern versions of Linux to overcome a bug in the Linux kernel's default behavior.
+  // When set to 0, it ensures that we receive only packets that were sent to the specified IP multicast address,
+  // even if some other process on the same system has joined a different multicast group with the same port number.
+  int multicastAll = 0;
+  (void)setsockopt(socket,
+		   domain == AF_INET ? IPPROTO_IP : IPPROTO_IPV6,
+		   IP_MULTICAST_ALL, // is this the same for IPv6?
+		   (void*)&multicastAll, sizeof multicastAll);
+  // Ignore the call's result.  Should it fail, we'll still receive packets (just perhaps more than intended)
+#endif
+}
+
 Boolean socketJoinGroup(UsageEnvironment& env, int socket,
-			netAddressBits groupAddress){
+			struct sockaddr_storage const& groupAddress){
   if (!IsMulticastAddress(groupAddress)) return True; // ignore this case
 
-  struct ip_mreq imr;
-  imr.imr_multiaddr.s_addr = groupAddress;
-  imr.imr_interface.s_addr = ReceivingInterfaceAddr;
-  if (setsockopt(socket, IPPROTO_IP, IP_ADD_MEMBERSHIP,
-		 (const char*)&imr, sizeof (struct ip_mreq)) < 0) {
+  int level, option_name;
+  void const* option_value;
+  SOCKLEN_T option_len;
+  struct ip_mreq imr4;
+  struct ipv6_mreq imr6;
+
+  switch (groupAddress.ss_family) {
+    case AF_INET: {
+      imr4.imr_multiaddr.s_addr = ((struct sockaddr_in&)groupAddress).sin_addr.s_addr;
+      imr4.imr_interface.s_addr = ReceivingInterfaceAddr;
+
+      level = IPPROTO_IP;
+      option_name = IP_ADD_MEMBERSHIP;
+      option_value = &imr4;
+      option_len = sizeof imr4;
+      break;
+    }
+    case AF_INET6: {
+      imr6.ipv6mr_multiaddr = ((struct sockaddr_in6&)groupAddress).sin6_addr;
+      imr6.ipv6mr_interface = 0; // ???
+
+      level = IPPROTO_IPV6;
+      option_name = IPV6_JOIN_GROUP;
+      option_value = &imr6;
+      option_len = sizeof imr6;
+      break;
+    }
+    default: {
+      return False;
+    }
+  }
+  if (setsockopt(socket, level, option_name, (const char*)option_value, option_len) < 0) {
 #if defined(__WIN32__) || defined(_WIN32)
     if (env.getErrno() != 0) {
       // That piece-of-shit toy operating system (Windows) sometimes lies
@@ -422,18 +625,47 @@ Boolean socketJoinGroup(UsageEnvironment& env, int socket,
 #endif
   }
 
+  clearMulticastAllSocketOption(socket, groupAddress.ss_family);
+
   return True;
 }
 
 Boolean socketLeaveGroup(UsageEnvironment&, int socket,
-			 netAddressBits groupAddress) {
+			 struct sockaddr_storage const& groupAddress) {
   if (!IsMulticastAddress(groupAddress)) return True; // ignore this case
 
-  struct ip_mreq imr;
-  imr.imr_multiaddr.s_addr = groupAddress;
-  imr.imr_interface.s_addr = ReceivingInterfaceAddr;
-  if (setsockopt(socket, IPPROTO_IP, IP_DROP_MEMBERSHIP,
-		 (const char*)&imr, sizeof (struct ip_mreq)) < 0) {
+  int level, option_name;
+  void const* option_value;
+  SOCKLEN_T option_len;
+  struct ip_mreq imr4;
+  struct ipv6_mreq imr6;
+
+  switch (groupAddress.ss_family) {
+    case AF_INET: {
+      imr4.imr_multiaddr.s_addr = ((struct sockaddr_in&)groupAddress).sin_addr.s_addr;
+      imr4.imr_interface.s_addr = ReceivingInterfaceAddr;
+
+      level = IPPROTO_IP;
+      option_name = IP_DROP_MEMBERSHIP;
+      option_value = &imr4;
+      option_len = sizeof imr4;
+      break;
+    }
+    case AF_INET6: {
+      imr6.ipv6mr_multiaddr = ((struct sockaddr_in6&)groupAddress).sin6_addr;
+      imr6.ipv6mr_interface = 0; // ???
+
+      level = IPPROTO_IPV6;
+      option_name = IPV6_LEAVE_GROUP;
+      option_value = &imr6;
+      option_len = sizeof imr6;
+      break;
+    }
+    default: {
+      return False;
+    }
+  }
+  if (setsockopt(socket, level, option_name, (const char*)option_value, option_len) < 0) {
     return False;
   }
 
@@ -464,18 +696,19 @@ struct ip_mreq_source {
 #endif
 
 Boolean socketJoinGroupSSM(UsageEnvironment& env, int socket,
-			   netAddressBits groupAddress,
-			   netAddressBits sourceFilterAddr) {
+			   struct sockaddr_storage const& groupAddress,
+			   struct sockaddr_storage const& sourceFilterAddr) {
   if (!IsMulticastAddress(groupAddress)) return True; // ignore this case
+  if (groupAddress.ss_family != AF_INET) return False; // later, support IPv6
 
   struct ip_mreq_source imr;
-#ifdef ANDROID
-    imr.imr_multiaddr = groupAddress;
-    imr.imr_sourceaddr = sourceFilterAddr;
+#if ANDROID_OLD_NDK
+    imr.imr_multiaddr = ((struct sockaddr_in&)groupAddress).sin_addr.s_addr;
+    imr.imr_sourceaddr = ((struct sockaddr_in&)sourceFilterAddr).sin_addr.s_addr;
     imr.imr_interface = ReceivingInterfaceAddr;
 #else
-    imr.imr_multiaddr.s_addr = groupAddress;
-    imr.imr_sourceaddr.s_addr = sourceFilterAddr;
+    imr.imr_multiaddr.s_addr = ((struct sockaddr_in&)groupAddress).sin_addr.s_addr;
+    imr.imr_sourceaddr.s_addr = ((struct sockaddr_in&)sourceFilterAddr).sin_addr.s_addr;
     imr.imr_interface.s_addr = ReceivingInterfaceAddr;
 #endif
   if (setsockopt(socket, IPPROTO_IP, IP_ADD_SOURCE_MEMBERSHIP,
@@ -484,22 +717,25 @@ Boolean socketJoinGroupSSM(UsageEnvironment& env, int socket,
     return False;
   }
 
+  clearMulticastAllSocketOption(socket, groupAddress.ss_family);
+
   return True;
 }
 
 Boolean socketLeaveGroupSSM(UsageEnvironment& /*env*/, int socket,
-			    netAddressBits groupAddress,
-			    netAddressBits sourceFilterAddr) {
+			    struct sockaddr_storage const& groupAddress,
+			    struct sockaddr_storage const& sourceFilterAddr) {
   if (!IsMulticastAddress(groupAddress)) return True; // ignore this case
+  if (groupAddress.ss_family != AF_INET) return False; // later, support IPv6
 
   struct ip_mreq_source imr;
-#ifdef ANDROID
-    imr.imr_multiaddr = groupAddress;
-    imr.imr_sourceaddr = sourceFilterAddr;
+#if ANDROID_OLD_NDK
+    imr.imr_multiaddr = ((struct sockaddr_in&)groupAddress).sin_addr.s_addr;
+    imr.imr_sourceaddr = ((struct sockaddr_in&)sourceFilterAddr).sin_addr.s_addr;
     imr.imr_interface = ReceivingInterfaceAddr;
 #else
-    imr.imr_multiaddr.s_addr = groupAddress;
-    imr.imr_sourceaddr.s_addr = sourceFilterAddr;
+    imr.imr_multiaddr.s_addr = ((struct sockaddr_in&)groupAddress).sin_addr.s_addr;
+    imr.imr_sourceaddr.s_addr = ((struct sockaddr_in&)sourceFilterAddr).sin_addr.s_addr;
     imr.imr_interface.s_addr = ReceivingInterfaceAddr;
 #endif
   if (setsockopt(socket, IPPROTO_IP, IP_DROP_SOURCE_MEMBERSHIP,
@@ -511,20 +747,28 @@ Boolean socketLeaveGroupSSM(UsageEnvironment& /*env*/, int socket,
 }
 
 static Boolean getSourcePort0(int socket, portNumBits& resultPortNum/*host order*/) {
-  sockaddr_in test; test.sin_port = 0;
-  SOCKLEN_T len = sizeof test;
-  if (getsockname(socket, (struct sockaddr*)&test, &len) < 0) return False;
+  sockaddr_storage testAddr;
+  setPortNum(testAddr, 0);
 
-  resultPortNum = ntohs(test.sin_port);
+  SOCKLEN_T len = sizeof testAddr;
+  if (getsockname(socket, (struct sockaddr*)&testAddr, &len) < 0) return False;
+
+  resultPortNum = ntohs(portNum(testAddr));
   return True;
 }
 
-Boolean getSourcePort(UsageEnvironment& env, int socket, Port& port) {
+Boolean getSourcePort(UsageEnvironment& env, int socket, int domain, Port& port) {
   portNumBits portNum = 0;
   if (!getSourcePort0(socket, portNum) || portNum == 0) {
     // Hack - call bind(), then try again:
-    MAKE_SOCKADDR_IN(name, INADDR_ANY, 0);
-    bind(socket, (struct sockaddr*)&name, sizeof name);
+    if (domain == AF_INET) { // IPv4
+      MAKE_SOCKADDR_IN(name, INADDR_ANY, 0);
+      bind(socket, (struct sockaddr*)&name, sizeof name);
+    } else { // IPv6
+      in6_addr const in6addr_any_init = IN6ADDR_ANY_INIT;
+      MAKE_SOCKADDR_IN6(name, in6addr_any_init, 0);
+      bind(socket, (struct sockaddr*)&name, sizeof name);
+    }
 
     if (!getSourcePort0(socket, portNum) || portNum == 0) {
       socketErr(env, "getsockname() error: ");
@@ -536,79 +780,168 @@ Boolean getSourcePort(UsageEnvironment& env, int socket, Port& port) {
   return True;
 }
 
-static Boolean badAddressForUs(netAddressBits addr) {
+static Boolean isBadIPv4AddressForUs(ipv4AddressBits addr) {
   // Check for some possible erroneous addresses:
-  netAddressBits nAddr = htonl(addr);
+  ipv4AddressBits nAddr = htonl(addr);
   return (nAddr == 0x7F000001 /* 127.0.0.1 */
 	  || nAddr == 0
-	  || nAddr == (netAddressBits)(~0));
+	  || nAddr == (ipv4AddressBits)(~0));
 }
 
-Boolean loopbackWorks = 1;
+static Boolean isBadIPv6AddressForUs(ipv6AddressBits addr) {
+  // We consider an IPv6 address bad if:
+  //   - the first 10 bits are 0xFE8, indicating a link-local or site-local address, or
+  //   - the first 15 bytes are 0, and the 16th byte is 0 (unspecified) or 1 (loopback)
+  if (addr[0] == 0xFE) return (addr[1]&0x80) != 0;
+  
+  for (unsigned i = 0; i < 15; ++i) {
+    if (addr[i] != 0) return False;
+  }
 
-netAddressBits ourIPAddress(UsageEnvironment& env) {
-  static netAddressBits ourAddress = 0;
-  int sock = -1;
-  struct in_addr testAddr;
+    return addr[15] == 0 || addr[15] == 1;
+}
 
-  if (ourAddress == 0) {
-    // We need to find our source address
-    struct sockaddr_in fromAddr;
-    fromAddr.sin_addr.s_addr = 0;
-
-    // Get our address by sending a (0-TTL) multicast packet,
-    // receiving it, and looking at the source address used.
-    // (This is kinda bogus, but it provides the best guarantee
-    // that other nodes will think our address is the same as we do.)
-    do {
-      loopbackWorks = 0; // until we learn otherwise
-
-      testAddr.s_addr = our_inet_addr("228.67.43.91"); // arbitrary
-      Port testPort(15947); // ditto
-
-      sock = setupDatagramSocket(env, testPort);
-      if (sock < 0) break;
-
-      if (!socketJoinGroup(env, sock, testAddr.s_addr)) break;
-
-      unsigned char testString[] = "hostIdTest";
-      unsigned testStringLength = sizeof testString;
-
-      if (!writeSocket(env, sock, testAddr, testPort, 0,
-		       testString, testStringLength)) break;
-
-      // Block until the socket is readable (with a 5-second timeout):
-      fd_set rd_set;
-      FD_ZERO(&rd_set);
-      FD_SET((unsigned)sock, &rd_set);
-      const unsigned numFds = sock+1;
-      struct timeval timeout;
-      timeout.tv_sec = 5;
-      timeout.tv_usec = 0;
-      int result = select(numFds, &rd_set, NULL, NULL, &timeout);
-      if (result <= 0) break;
-
-      unsigned char readBuffer[20];
-      int bytesRead = readSocket(env, sock,
-				 readBuffer, sizeof readBuffer,
-				 fromAddr);
-      if (bytesRead != (int)testStringLength
-	  || strncmp((char*)readBuffer, (char*)testString, testStringLength) != 0) {
-	break;
-      }
-
-      // We use this packet's source address, if it's good:
-      loopbackWorks = !badAddressForUs(fromAddr.sin_addr.s_addr);
-    } while (0);
-
-    if (sock >= 0) {
-      socketLeaveGroup(env, sock, testAddr.s_addr);
-      closeSocket(sock);
+static Boolean isBadAddressForUs(struct sockaddr const& addr) {
+  switch (addr.sa_family) {
+    case AF_INET: {
+      return isBadIPv4AddressForUs(((sockaddr_in&)addr).sin_addr.s_addr);
     }
+    case AF_INET6: {
+      return isBadIPv6AddressForUs(((sockaddr_in6&)addr).sin6_addr.s6_addr);
+    }
+    default: {
+      return True;
+    }
+  }
+}
 
-    if (!loopbackWorks) do {
-      // We couldn't find our address using multicast loopback,
-      // so try instead to look it up directly - by first getting our host name, and then resolving this host name
+static Boolean isBadAddressForUs(NetAddress const& addr) {
+  if (addr.length() == sizeof (ipv4AddressBits)) {
+    return isBadIPv4AddressForUs(*(ipv4AddressBits*)(addr.data()));
+  } else if (addr.length() == sizeof (ipv6AddressBits)) {
+    return isBadIPv6AddressForUs(*(ipv6AddressBits*)(addr.data()));
+  } else {
+    return True;
+  }
+}
+
+static void getOurIPAddresses(UsageEnvironment& env); // forward
+
+static ipv4AddressBits _ourIPv4Address = 0;
+#define _weHaveAnIPv4Address (_ourIPv4Address != 0)
+
+ipv4AddressBits ourIPv4Address(UsageEnvironment& env) {
+  if (ReceivingInterfaceAddr != INADDR_ANY) {
+    // Hack: If we were told to receive on a specific interface address, then 
+    // define this to be our ip address:
+    _ourIPv4Address = ReceivingInterfaceAddr;
+  }
+
+  if (!_weHaveAnIPv4Address) {
+    getOurIPAddresses(env);
+  }
+
+  return _ourIPv4Address;
+}
+
+static ipv6AddressBits _ourIPv6Address;
+static Boolean _weHaveAnIPv6Address = False;
+
+ipv6AddressBits const& ourIPv6Address(UsageEnvironment& env) {
+  if (!_weHaveAnIPv6Address) {
+    getOurIPAddresses(env);
+  }
+
+  return _ourIPv6Address;
+}
+
+Boolean weHaveAnIPv4Address(UsageEnvironment& env) {
+  if (_weHaveAnIPv4Address || _weHaveAnIPv6Address) return _weHaveAnIPv4Address;
+
+  getOurIPAddresses(env);
+  return _weHaveAnIPv4Address;
+}
+
+Boolean weHaveAnIPv6Address(UsageEnvironment& env) {
+  if (_weHaveAnIPv4Address || _weHaveAnIPv6Address) return _weHaveAnIPv6Address;
+
+  getOurIPAddresses(env);
+  return _weHaveAnIPv6Address;
+}
+
+Boolean weHaveAnIPAddress(UsageEnvironment& env) {
+  if (_weHaveAnIPv4Address || _weHaveAnIPv6Address) return True;
+
+  getOurIPAddresses(env);
+  return _weHaveAnIPv4Address || _weHaveAnIPv6Address;
+}
+
+static void copyAddress(struct sockaddr_storage& to, struct sockaddr const* from) {
+  // Copy a "struct sockaddr" to a "struct sockaddr_storage" (assumed to be large enough)
+  if (from == NULL) return;
+  
+  switch (from->sa_family) {
+    case AF_INET: {
+#ifdef HAVE_SOCKADDR_LEN
+      if (from->sa_len < sizeof (struct sockaddr_in)) return; // sanity check
+      to.ss_len = sizeof (struct sockaddr_in);
+#endif
+      to.ss_family = AF_INET;
+      ((sockaddr_in&)to).sin_addr.s_addr = ((sockaddr_in const*)from)->sin_addr.s_addr;
+      break;
+    }
+    case AF_INET6: {
+#ifdef HAVE_SOCKADDR_LEN
+      if (from->sa_len < sizeof (struct sockaddr_in6)) return; // sanity check
+      to.ss_len = sizeof (struct sockaddr_in6);
+#endif
+      to.ss_family = AF_INET6;
+      for (unsigned i = 0; i < 16; ++i) {
+	((sockaddr_in6&)to).sin6_addr.s6_addr[i] = ((sockaddr_in6 const*)from)->sin6_addr.s6_addr[i];
+      }
+      break;
+    }
+  }
+}
+
+void getOurIPAddresses(UsageEnvironment& env) {
+  // We use two methods to (try to) get our IP addresses.
+  // First, we use "getifaddrs()".  But if that doesn't work
+  // (or if "getifaddrs()" is not defined), then we use an alternative (more old-fashioned)
+  // mechanism: First get our host name, then try resolving this host name.
+  struct sockaddr_storage foundIPv4Address = nullAddress(AF_INET);
+  struct sockaddr_storage foundIPv6Address = nullAddress(AF_INET6);
+
+  Boolean getifaddrsWorks = False; // until we learn otherwise
+#ifndef NO_GETIFADDRS
+  struct ifaddrs* ifap;
+
+  if (getifaddrs(&ifap) == 0) {
+    // Look through all interfaces:
+    for (struct ifaddrs* p = ifap; p != NULL; p = p->ifa_next) {
+      // Ignore an interface if it's not up, or is a loopback interface:
+      if ((p->ifa_flags&IFF_UP) == 0 || (p->ifa_flags&IFF_LOOPBACK) != 0) continue;
+
+      // Also ignore the interface if the address is considered 'bad' for us:
+      if (p->ifa_addr == NULL || isBadAddressForUs(*p->ifa_addr)) continue;
+      
+      // We take the first IPv4 and first IPv6 addresses:
+      if (p->ifa_addr->sa_family == AF_INET && addressIsNull(foundIPv4Address)) {
+	copyAddress(foundIPv4Address, p->ifa_addr);
+	getifaddrsWorks = True;
+      } else if (p->ifa_addr->sa_family == AF_INET6 && addressIsNull(foundIPv6Address)) {
+	copyAddress(foundIPv6Address, p->ifa_addr);
+	getifaddrsWorks = True;
+      }
+    }
+    freeifaddrs(ifap);
+  }
+#endif
+
+    if (!getifaddrsWorks) do {
+      // We couldn't find our address using "getifaddrs()",
+      // so try instead to look it up directly - by first getting our host name,
+      // and then resolving this host name
       char hostname[100];
       hostname[0] = '\0';
       int result = gethostname(hostname, sizeof hostname);
@@ -617,56 +950,57 @@ netAddressBits ourIPAddress(UsageEnvironment& env) {
 	break;
       }
 
-      // Try to resolve "hostname" to an IP address:
+      // Try to resolve "hostname" to one or more IP addresses:
       NetAddressList addresses(hostname);
       NetAddressList::Iterator iter(addresses);
-      NetAddress const* address;
 
-      // Take the first address that's not bad:
-      netAddressBits addr = 0;
+      // Look at each address, rejecting any that are bad.
+      // We take the first IPv4 and first IPv6 addresses, if any.
+      NetAddress const* address;
       while ((address = iter.nextAddress()) != NULL) {
-	netAddressBits a = *(netAddressBits*)(address->data());
-	if (!badAddressForUs(a)) {
-	  addr = a;
-	  break;
+	if (isBadAddressForUs(*address)) continue;
+
+	if (address->length() == sizeof (ipv4AddressBits) && addressIsNull(foundIPv4Address)) {
+	  copyAddress(foundIPv4Address, address);
+	} else if (address->length() == sizeof (ipv6AddressBits) && addressIsNull(foundIPv6Address)) {
+	  copyAddress(foundIPv6Address, address);
 	}
       }
-
-      // Assign the address that we found to "fromAddr" (as if the 'loopback' method had worked), to simplify the code below: 
-      fromAddr.sin_addr.s_addr = addr;
     } while (0);
 
-    // Make sure we have a good address:
-    netAddressBits from = fromAddr.sin_addr.s_addr;
-    if (badAddressForUs(from)) {
-      char tmp[100];
-      sprintf(tmp, "This computer has an invalid IP address: %s", AddressString(from).val());
-      env.setResultMsg(tmp);
-      from = 0;
+    // Note the IPv4 and IPv6 addresses that we found:
+    _ourIPv4Address = ((sockaddr_in&)foundIPv4Address).sin_addr.s_addr;
+
+    for (unsigned i = 0; i < 16; ++i) {
+      _ourIPv6Address[i] = ((sockaddr_in6&)foundIPv6Address).sin6_addr.s6_addr[i];
+      if (_ourIPv6Address[i] != 0) _weHaveAnIPv6Address = True;
     }
 
-    ourAddress = from;
+    if (!_weHaveAnIPv4Address && !_weHaveAnIPv6Address) {
+      env.setResultMsg("This computer does not have a valid IP (v4 or v6) address!");
+    }
 
-    // Use our newly-discovered IP address, and the current time,
+    // Use our newly-discovered IP addresses, and the current time,
     // to initialize the random number generator's seed:
     struct timeval timeNow;
     gettimeofday(&timeNow, NULL);
-    unsigned seed = ourAddress^timeNow.tv_sec^timeNow.tv_usec;
+    unsigned seed = _ourIPv4Address^timeNow.tv_sec^timeNow.tv_usec;
+    for (unsigned i = 0; i < 16; i += 4) {
+      seed ^= (_ourIPv6Address[i]<<24)|(_ourIPv6Address[i+1]<<16)|(_ourIPv6Address[i+2]<<8)|_ourIPv6Address[i+3];
+    }
     our_srandom(seed);
-  }
-  return ourAddress;
 }
 
-netAddressBits chooseRandomIPv4SSMAddress(UsageEnvironment& env) {
+ipv4AddressBits chooseRandomIPv4SSMAddress(UsageEnvironment& env) {
   // First, a hack to ensure that our random number generator is seeded:
-  (void) ourIPAddress(env);
+  (void)ourIPv4Address(env);
 
   // Choose a random address in the range [232.0.1.0, 232.255.255.255)
   // i.e., [0xE8000100, 0xE8FFFFFF)
-  netAddressBits const first = 0xE8000100, lastPlus1 = 0xE8FFFFFF;
-  netAddressBits const range = lastPlus1 - first;
+  ipv4AddressBits const first = 0xE8000100, lastPlus1 = 0xE8FFFFFF;
+  ipv4AddressBits const range = lastPlus1 - first;
 
-  return ntohl(first + ((netAddressBits)our_random())%range);
+  return ntohl(first + ((ipv4AddressBits)our_random())%range);
 }
 
 char const* timestampString() {
@@ -675,7 +1009,9 @@ char const* timestampString() {
 
 #if !defined(_WIN32_WCE)
   static char timeString[9]; // holds hh:mm:ss plus trailing '\0'
-  char const* ctimeResult = ctime((time_t*)&tvNow.tv_sec);
+
+  time_t tvNow_t = tvNow.tv_sec;
+  char const* ctimeResult = ctime(&tvNow_t);
   if (ctimeResult == NULL) {
     sprintf(timeString, "??:??:??");
   } else {
@@ -697,60 +1033,88 @@ char const* timestampString() {
   return (char const*)&timeString;
 }
 
-#if defined(__WIN32__) || defined(_WIN32)
+#if (defined(__WIN32__) || defined(_WIN32)) && !defined(__MINGW32__)
 // For Windoze, we need to implement our own gettimeofday()
+
+// used to make sure that static variables in gettimeofday() aren't initialized simultaneously by multiple threads
+static LONG initializeLock_gettimeofday = 0;  
+
 #if !defined(_WIN32_WCE)
 #include <sys/timeb.h>
 #endif
 
 int gettimeofday(struct timeval* tp, int* /*tz*/) {
-#if defined(_WIN32_WCE)
-  /* FILETIME of Jan 1 1970 00:00:00. */
-  static const unsigned __int64 epoch = 116444736000000000LL;
-
-  FILETIME    file_time;
-  SYSTEMTIME  system_time;
-  ULARGE_INTEGER ularge;
-
-  GetSystemTime(&system_time);
-  SystemTimeToFileTime(&system_time, &file_time);
-  ularge.LowPart = file_time.dwLowDateTime;
-  ularge.HighPart = file_time.dwHighDateTime;
-
-  tp->tv_sec = (long) ((ularge.QuadPart - epoch) / 10000000L);
-  tp->tv_usec = (long) (system_time.wMilliseconds * 1000);
-#else
   static LARGE_INTEGER tickFrequency, epochOffset;
 
-  // For our first call, use "ftime()", so that we get a time with a proper epoch.
-  // For subsequent calls, use "QueryPerformanceCount()", because it's more fine-grain.
-  static Boolean isFirstCall = True;
+  static Boolean isInitialized = False;
 
   LARGE_INTEGER tickNow;
+
+#if !defined(_WIN32_WCE)
   QueryPerformanceCounter(&tickNow);
-
-  if (isFirstCall) {
-    struct timeb tb;
-    ftime(&tb);
-    tp->tv_sec = tb.time;
-    tp->tv_usec = 1000*tb.millitm;
-
-    // Also get our counter frequency:
-    QueryPerformanceFrequency(&tickFrequency);
-
-    // And compute an offset to add to subsequent counter times, so we get a proper epoch:
-    epochOffset.QuadPart
-      = tb.time*tickFrequency.QuadPart + (tb.millitm*tickFrequency.QuadPart)/1000 - tickNow.QuadPart;
-
-    isFirstCall = False; // for next time
-  } else {
-    // Adjust our counter time so that we get a proper epoch:
-    tickNow.QuadPart += epochOffset.QuadPart;
-
-    tp->tv_sec = (long) (tickNow.QuadPart / tickFrequency.QuadPart);
-    tp->tv_usec = (long) (((tickNow.QuadPart % tickFrequency.QuadPart) * 1000000L) / tickFrequency.QuadPart);
-  }
+#else
+  tickNow.QuadPart = GetTickCount();
 #endif
+ 
+  if (!isInitialized) {
+    if(1 == InterlockedIncrement(&initializeLock_gettimeofday)) {
+#if !defined(_WIN32_WCE)
+      // For our first call, use "ftime()", so that we get a time with a proper epoch.
+      // For subsequent calls, use "QueryPerformanceCount()", because it's more fine-grain.
+      struct timeb tb;
+      ftime(&tb);
+      tp->tv_sec = tb.time;
+      tp->tv_usec = 1000*tb.millitm;
+
+      // Also get our counter frequency:
+      QueryPerformanceFrequency(&tickFrequency);
+#else
+      /* FILETIME of Jan 1 1970 00:00:00. */
+      const LONGLONG epoch = 116444736000000000LL;
+      FILETIME fileTime;
+      LARGE_INTEGER time;
+      GetSystemTimeAsFileTime(&fileTime);
+
+      time.HighPart = fileTime.dwHighDateTime;
+      time.LowPart = fileTime.dwLowDateTime;
+
+      // convert to from 100ns time to unix timestamp in seconds, 1000*1000*10
+      tp->tv_sec = (long)((time.QuadPart - epoch) / 10000000L);
+
+      /*
+        GetSystemTimeAsFileTime has just a seconds resolution,
+        thats why wince-version of gettimeofday is not 100% accurate, usec accuracy would be calculated like this:
+        // convert 100 nanoseconds to usec
+        tp->tv_usec= (long)((time.QuadPart - epoch)%10000000L) / 10L;
+      */
+      tp->tv_usec = 0;
+
+      // resolution of GetTickCounter() is always milliseconds
+      tickFrequency.QuadPart = 1000;
+#endif     
+      // compute an offset to add to subsequent counter times, so we get a proper epoch:
+      epochOffset.QuadPart
+          = tp->tv_sec * tickFrequency.QuadPart + (tp->tv_usec * tickFrequency.QuadPart) / 1000000L - tickNow.QuadPart;
+      
+      // next caller can use ticks for time calculation
+      isInitialized = True; 
+      return 0;
+    } else {
+        InterlockedDecrement(&initializeLock_gettimeofday);
+        // wait until first caller has initialized static values
+        while(!isInitialized){
+          Sleep(1);
+        }
+    }
+  }
+
+  // adjust our tick count so that we get a proper epoch:
+  tickNow.QuadPart += epochOffset.QuadPart;
+
+  tp->tv_sec =  (long)(tickNow.QuadPart / tickFrequency.QuadPart);
+  tp->tv_usec = (long)(((tickNow.QuadPart % tickFrequency.QuadPart) * 1000000L) / tickFrequency.QuadPart);
+
   return 0;
 }
 #endif
+#undef ANDROID_OLD_NDK

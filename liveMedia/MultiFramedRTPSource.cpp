@@ -1,7 +1,7 @@
 /**********
 This library is free software; you can redistribute it and/or modify it under
 the terms of the GNU Lesser General Public License as published by the
-Free Software Foundation; either version 2.1 of the License, or (at your
+Free Software Foundation; either version 3 of the License, or (at your
 option) any later version. (See <http://www.gnu.org/copyleft/lesser.html>.)
 
 This library is distributed in the hope that it will be useful, but WITHOUT
@@ -14,12 +14,13 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 **********/
 // "liveMedia"
-// Copyright (c) 1996-2012 Live Networks, Inc.  All rights reserved.
+// Copyright (c) 1996-2026 Live Networks, Inc.  All rights reserved.
 // RTP source for a common kind of payload format: Those that pack multiple,
 // complete codec frames (as many as possible) into each RTP packet.
 // Implementation
 
 #include "MultiFramedRTPSource.hh"
+#include "RTCP.hh"
 #include "GroupsockHelper.hh"
 #include <string.h>
 
@@ -85,7 +86,6 @@ void MultiFramedRTPSource::reset() {
 }
 
 MultiFramedRTPSource::~MultiFramedRTPSource() {
-  fRTPInterface.stopNetworkReading();
   delete fReorderingBuffer;
 }
 
@@ -105,6 +105,11 @@ Boolean MultiFramedRTPSource
 }
 
 void MultiFramedRTPSource::doStopGettingFrames() {
+  if (fPacketReadInProgress != NULL) {
+    fReorderingBuffer->freePacket(fPacketReadInProgress);
+    fPacketReadInProgress = NULL;
+  }
+  envir().taskScheduler().unscheduleDelayedTask(nextTask());
   fRTPInterface.stopNetworkReading();
   fReorderingBuffer->reset();
   reset();
@@ -144,7 +149,7 @@ void MultiFramedRTPSource::doGetNextFrame1() {
 	// Something's wrong with the header; reject the packet:
 	fReorderingBuffer->releaseUsedPacket(nextPacket);
 	fNeedDelivery = True;
-	break;
+	continue;
       }
       nextPacket->skip(specialHeaderSize);
     }
@@ -167,7 +172,7 @@ void MultiFramedRTPSource::doGetNextFrame1() {
       // This packet is unusable; reject it:
       fReorderingBuffer->releaseUsedPacket(nextPacket);
       fNeedDelivery = True;
-      break;
+      continue;
     }
 
     // The packet is usable. Deliver all or part of it to our caller:
@@ -183,7 +188,7 @@ void MultiFramedRTPSource::doGetNextFrame1() {
       fReorderingBuffer->releaseUsedPacket(nextPacket);
     }
 
-    if (fCurrentPacketCompletesFrame) {
+    if (fCurrentPacketCompletesFrame && fFrameSize > 0) {
       // We have all the data that the client wants.
       if (fNumTruncatedBytes > 0) {
 	envir() << "MultiFramedRTPSource::doGetNextFrame1(): The total received frame size exceeds the client's buffer size ("
@@ -231,11 +236,13 @@ void MultiFramedRTPSource::networkReadHandler1() {
   // Read the network packet, and perform sanity checks on the RTP header:
   Boolean readSuccess = False;
   do {
+    struct sockaddr_storage fromAddress;
     Boolean packetReadWasIncomplete = fPacketReadInProgress != NULL;
-    if (!bPacket->fillInData(fRTPInterface, packetReadWasIncomplete)) {
-      if (bPacket->bytesAvailable() == 0) {
-	envir() << "MultiFramedRTPSource error: Hit limit when reading incoming packet over TCP. Increase \"MAX_PACKET_SIZE\"\n";
+    if (!bPacket->fillInData(fRTPInterface, fromAddress, packetReadWasIncomplete)) {
+      if (bPacket->bytesAvailable() == 0) { // should not happen??
+	envir() << "MultiFramedRTPSource internal error: Hit limit when reading incoming packet over TCP\n";
       }
+      fPacketReadInProgress = NULL;
       break;
     }
     if (packetReadWasIncomplete) {
@@ -251,6 +258,13 @@ void MultiFramedRTPSource::networkReadHandler1() {
     if ((our_random()%10) == 0) break; // simulate 10% packet loss
 #endif
 
+    if (fCrypto != NULL) { // The packet is SRTP; authenticate/decrypt it first
+      unsigned newPacketSize;
+      if (!fCrypto->processIncomingSRTPPacket(bPacket->data(), bPacket->dataSize(), newPacketSize)) break;
+      if (newPacketSize > bPacket->dataSize()) break; // sanity check; shouldn't happen
+      bPacket->removePadding(bPacket->dataSize() - newPacketSize); // treat MKI+auth as padding
+    }
+
     // Check for the 12-byte RTP header:
     if (bPacket->dataSize() < 12) break;
     unsigned rtpHdr = ntohl(*(u_int32_t*)(bPacket->data())); ADVANCE(4);
@@ -261,9 +275,22 @@ void MultiFramedRTPSource::networkReadHandler1() {
     // Check the RTP version number (it should be 2):
     if ((rtpHdr&0xC0000000) != 0x80000000) break;
 
+    // Check the Payload Type.
+    unsigned char rtpPayloadType = (unsigned char)((rtpHdr&0x007F0000)>>16);
+    if (rtpPayloadType != rtpPayloadFormat()) {
+      if (fRTCPInstanceForMultiplexedRTCPPackets != NULL
+	  && rtpPayloadType >= 64 && rtpPayloadType <= 95) {
+	// This is a multiplexed RTCP packet, and we've been asked to deliver such packets.
+	// Do so now:
+	fRTCPInstanceForMultiplexedRTCPPackets
+	  ->injectReport(bPacket->data()-12, bPacket->dataSize()+12, fromAddress);
+      }
+      break;
+    }
+
     // Skip over any CSRC identifiers in the header:
-    unsigned cc = (rtpHdr>>24)&0xF;
-    if (bPacket->dataSize() < cc) break;
+    unsigned cc = (rtpHdr>>24)&0x0F;
+    if (bPacket->dataSize() < cc*4) break;
     ADVANCE(cc*4);
 
     // Check for (& ignore) any RTP header extension
@@ -282,11 +309,6 @@ void MultiFramedRTPSource::networkReadHandler1() {
 	= (unsigned)(bPacket->data())[bPacket->dataSize()-1];
       if (bPacket->dataSize() < numPaddingBytes) break;
       bPacket->removePadding(numPaddingBytes);
-    }
-    // Check the Payload Type.
-    if ((unsigned char)((rtpHdr&0x007F0000)>>16)
-	!= rtpPayloadFormat()) {
-      break;
     }
 
     // The rest of the packet is the usable data.  Record and save it:
@@ -327,7 +349,7 @@ void MultiFramedRTPSource::networkReadHandler1() {
 
 ////////// BufferedPacket and BufferedPacketFactory implementation /////
 
-#define MAX_PACKET_SIZE 20000
+#define MAX_PACKET_SIZE 65536
 
 BufferedPacket::BufferedPacket()
   : fPacketSize(MAX_PACKET_SIZE),
@@ -336,7 +358,20 @@ BufferedPacket::BufferedPacket()
 }
 
 BufferedPacket::~BufferedPacket() {
-  delete fNextPacket;
+  /////
+  // Replace tail recursion with iteration, in case the compiler isn't smart enough to do this.
+  // I.e., replace:
+  //    delete fNextPacket;
+  // with:
+  BufferedPacket* nextPacket = fNextPacket;
+  while (nextPacket != NULL) {
+    BufferedPacket* tmpPacket = nextPacket;
+    nextPacket = tmpPacket->fNextPacket;
+    tmpPacket->fNextPacket = NULL;
+    delete tmpPacket;
+  }
+  /////
+
   delete[] fBuf;
 }
 
@@ -370,14 +405,20 @@ void BufferedPacket
   frameDurationInMicroseconds = 0; // by default.  Subclasses should correct this.
 }
 
-Boolean BufferedPacket::fillInData(RTPInterface& rtpInterface, Boolean& packetReadWasIncomplete) {
+Boolean BufferedPacket::fillInData(RTPInterface& rtpInterface, struct sockaddr_storage& fromAddress,
+				   Boolean& packetReadWasIncomplete) {
   if (!packetReadWasIncomplete) reset();
 
-  unsigned numBytesRead;
-  struct sockaddr_in fromAddress;
   unsigned const maxBytesToRead = bytesAvailable();
   if (maxBytesToRead == 0) return False; // exceeded buffer size when reading over TCP
-  if (!rtpInterface.handleRead(&fBuf[fTail], maxBytesToRead, numBytesRead, fromAddress, packetReadWasIncomplete)) {
+
+  unsigned numBytesRead;
+  int tcpSocketNum; // not used
+  unsigned char tcpStreamChannelId; // not used
+  if (!rtpInterface.handleRead(&fBuf[fTail], maxBytesToRead,
+			       numBytesRead, fromAddress,
+			       tcpSocketNum, tcpStreamChannelId,
+			       packetReadWasIncomplete)) {
     return False;
   }
   fTail += numBytesRead;
@@ -422,6 +463,13 @@ void BufferedPacket::use(unsigned char* to, unsigned toSize,
   unsigned char* origFramePtr = &fBuf[fHead];
   unsigned char* newFramePtr = origFramePtr; // may change in the call below
   unsigned frameSize, frameDurationInMicroseconds;
+
+  rtpSeqNo = fRTPSeqNo;
+  rtpTimestamp = fRTPTimestamp;
+  presentationTime = fPresentationTime;
+  hasBeenSyncedUsingRTCP = fHasBeenSyncedUsingRTCP;
+  rtpMarkerBit = fRTPMarkerBit;
+
   getNextEnclosedFrameParameters(newFramePtr, fTail - fHead,
 				 frameSize, frameDurationInMicroseconds);
   if (frameSize > toSize) {
@@ -435,12 +483,6 @@ void BufferedPacket::use(unsigned char* to, unsigned toSize,
   memmove(to, newFramePtr, bytesUsed);
   fHead += (newFramePtr - origFramePtr) + frameSize;
   ++fUseCount;
-
-  rtpSeqNo = fRTPSeqNo;
-  rtpTimestamp = fRTPTimestamp;
-  presentationTime = fPresentationTime;
-  hasBeenSyncedUsingRTCP = fHasBeenSyncedUsingRTCP;
-  rtpMarkerBit = fRTPMarkerBit;
 
   // Update "fPresentationTime" for the next enclosed frame (if any):
   fPresentationTime.tv_usec += frameDurationInMicroseconds;

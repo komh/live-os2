@@ -1,7 +1,7 @@
 /**********
 This library is free software; you can redistribute it and/or modify it under
 the terms of the GNU Lesser General Public License as published by the
-Free Software Foundation; either version 2.1 of the License, or (at your
+Free Software Foundation; either version 3 of the License, or (at your
 option) any later version. (See <http://www.gnu.org/copyleft/lesser.html>.)
 
 This library is distributed in the hope that it will be useful, but WITHOUT
@@ -14,7 +14,7 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 **********/
 // "liveMedia"
-// Copyright (c) 1996-2012 Live Networks, Inc.  All rights reserved.
+// Copyright (c) 1996-2026 Live Networks, Inc.  All rights reserved.
 // RTP Sources
 // C++ header
 
@@ -26,6 +26,9 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 #endif
 #ifndef _RTP_INTERFACE_HH
 #include "RTPInterface.hh"
+#endif
+#ifndef _SRTP_CRYPTOGRAPHIC_CONTEXT_HH
+#include "SRTPCryptographicContext.hh"
 #endif
 
 class RTPReceptionStatsDB; // forward
@@ -45,10 +48,16 @@ public:
 
   virtual void setPacketReorderingThresholdTime(unsigned uSeconds) = 0;
 
+  void setCrypto(SRTPCryptographicContext* crypto) { fCrypto = crypto; }
+
   // used by RTCP:
   u_int32_t SSRC() const { return fSSRC; }
       // Note: This is *our* SSRC, not the SSRC in incoming RTP packets.
      // later need a means of changing the SSRC if there's a collision #####
+  void registerForMultiplexedRTCPPackets(class RTCPInstance* rtcpInstance) {
+    fRTCPInstanceForMultiplexedRTCPPackets = rtcpInstance;
+  }
+  void deregisterForMultiplexedRTCPPackets() { registerForMultiplexedRTCPPackets(NULL); }
 
   unsigned timestampFrequency() const {return fTimestampFrequency;}
 
@@ -60,13 +69,11 @@ public:
   // Note: This is the SSRC in the most recently received RTP packet; not *our* SSRC
 
   Boolean& enableRTCPReports() { return fEnableRTCPReports; }
+  Boolean const& enableRTCPReports() const { return fEnableRTCPReports; }
 
-  void setStreamSocket(int sockNum, unsigned char streamChannelId) {
+  void setStreamSocket(int sockNum, unsigned char streamChannelId, TLSState* tlsState) {
     // hack to allow sending RTP over TCP (RFC 2236, section 10.12)
-    fRTPInterface.setStreamSocket(sockNum, streamChannelId);
-  }
-  void setServerRequestAlternativeByteHandler(int socketNum, ServerRequestAlternativeByteHandler* handler, void* clientData) {
-    fRTPInterface.setServerRequestAlternativeByteHandler(socketNum, handler, clientData);
+    fRTPInterface.setStreamSocket(sockNum, streamChannelId, tlsState);
   }
 
   void setAuxilliaryReadHandler(AuxHandlerFunc* handlerFunc,
@@ -79,6 +86,7 @@ public:
   // RTP sequence numbers and timestamps are usually not useful to receivers.
   // (Our implementation of RTP reception already does all needed handling of RTP sequence numbers and timestamps.)
   u_int16_t curPacketRTPSeqNum() const { return fCurPacketRTPSeqNum; }
+private: friend class MediaSubsession; // "MediaSubsession" is the only outside class that ever needs to see RTP timestamps!
   u_int32_t curPacketRTPTimestamp() const { return fCurPacketRTPTimestamp; }
 
 protected:
@@ -94,6 +102,8 @@ protected:
   Boolean fCurPacketMarkerBit;
   Boolean fCurPacketHasBeenSynchronizedUsingRTCP;
   u_int32_t fLastReceivedSSRC;
+  class RTCPInstance* fRTCPInstanceForMultiplexedRTCPPackets;
+  SRTPCryptographicContext* fCrypto;
 
 private:
   // redefined virtual functions:

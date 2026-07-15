@@ -1,7 +1,7 @@
 /**********
 This library is free software; you can redistribute it and/or modify it under
 the terms of the GNU Lesser General Public License as published by the
-Free Software Foundation; either version 2.1 of the License, or (at your
+Free Software Foundation; either version 3 of the License, or (at your
 option) any later version. (See <http://www.gnu.org/copyleft/lesser.html>.)
 
 This library is distributed in the hope that it will be useful, but WITHOUT
@@ -13,7 +13,7 @@ You should have received a copy of the GNU Lesser General Public License
 along with this library; if not, write to the Free Software Foundation, Inc.,
 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 **********/
-// Copyright (c) 1996-2012 Live Networks, Inc.  All rights reserved.
+// Copyright (c) 1996-2026 Live Networks, Inc.  All rights reserved.
 // Basic Usage Environment: for a simple, non-scripted, console application
 // C++ header
 
@@ -67,7 +67,12 @@ private:
 
 class HandlerSet; // forward
 
+// Note: You may redefine MAX_NUM_EVENT_TRIGGERS,
+// but it must be <= the number of bits in an "EventTriggerId"
+#ifndef MAX_NUM_EVENT_TRIGGERS
 #define MAX_NUM_EVENT_TRIGGERS 32
+#endif
+#define EVENT_TRIGGER_ID_HIGH_BIT (1 << (MAX_NUM_EVENT_TRIGGERS-1))
 
 // An abstract base class, useful for subclassing
 // (e.g., to redefine the implementation of socket event handling)
@@ -86,7 +91,7 @@ public:
 				void* clientData);
   virtual void unscheduleDelayedTask(TaskToken& prevTask);
 
-  virtual void doEventLoop(char* watchVariable);
+  virtual void doEventLoop(EventLoopWatchVariable* watchVariable);
 
   virtual EventTriggerId createEventTrigger(TaskFunc* eventHandlerProc);
   virtual void deleteEventTrigger(EventTriggerId eventTriggerId);
@@ -97,6 +102,7 @@ protected:
 
 protected:
   // To implement delayed operations:
+  intptr_t fTokenCounter;
   DelayQueue fDelayQueue;
 
   // To implement background reads:
@@ -104,10 +110,16 @@ protected:
   int fLastHandledSocketNum;
 
   // To implement event triggers:
-  EventTriggerId fTriggersAwaitingHandling, fLastUsedTriggerMask; // implemented as 32-bit bitmaps
+#ifndef NO_STD_LIB
+  std::atomic_flag fTriggersAwaitingHandling[MAX_NUM_EVENT_TRIGGERS];
+#else
+  Boolean volatile fTriggersAwaitingHandling[MAX_NUM_EVENT_TRIGGERS];
+#endif
+  u_int32_t fLastUsedTriggerMask; // implemented as a 32-bit bitmap
   TaskFunc* fTriggeredEventHandlers[MAX_NUM_EVENT_TRIGGERS];
   void* fTriggeredEventClientDatas[MAX_NUM_EVENT_TRIGGERS];
   unsigned fLastUsedTriggerNum; // in the range [0,MAX_NUM_EVENT_TRIGGERS)
+  Boolean fEventTriggersAreBeingUsed;
 };
 
 #endif

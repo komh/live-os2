@@ -1,7 +1,7 @@
 /**********
 This library is free software; you can redistribute it and/or modify it under
 the terms of the GNU Lesser General Public License as published by the
-Free Software Foundation; either version 2.1 of the License, or (at your
+Free Software Foundation; either version 3 of the License, or (at your
 option) any later version. (See <http://www.gnu.org/copyleft/lesser.html>.)
 
 This library is distributed in the hope that it will be useful, but WITHOUT
@@ -13,7 +13,7 @@ You should have received a copy of the GNU Lesser General Public License
 along with this library; if not, write to the Free Software Foundation, Inc.,
 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 **********/
-// Copyright (c) 1996-2012, Live Networks, Inc.  All rights reserved
+// Copyright (c) 1996-2026, Live Networks, Inc.  All rights reserved
 // A common framework, used for the "openRTSP" and "playSIP" applications
 // Implementation
 //
@@ -33,22 +33,28 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 #endif
 
 // Forward function definitions:
+void continueAfterClientCreation0(RTSPClient* client, Boolean requestStreamingOverTCP);
+void continueAfterClientCreation1();
 void continueAfterOPTIONS(RTSPClient* client, int resultCode, char* resultString);
 void continueAfterDESCRIBE(RTSPClient* client, int resultCode, char* resultString);
 void continueAfterSETUP(RTSPClient* client, int resultCode, char* resultString);
 void continueAfterPLAY(RTSPClient* client, int resultCode, char* resultString);
 void continueAfterTEARDOWN(RTSPClient* client, int resultCode, char* resultString);
 
+void createOutputFiles(char const* periodicFilenameSuffix);
+void createPeriodicOutputFiles();
 void setupStreams();
 void closeMediaSinks();
 void subsessionAfterPlaying(void* clientData);
-void subsessionByeHandler(void* clientData);
+void subsessionByeHandler(void* clientData, char const* reason);
 void sessionAfterPlaying(void* clientData = NULL);
 void sessionTimerHandler(void* clientData);
+void periodicFileOutputTimerHandler(void* clientData);
 void shutdown(int exitCode = 1);
 void signalHandlerShutdown(int sig);
 void checkForPacketArrival(void* clientData);
 void checkInterPacketGaps(void* clientData);
+void checkSessionTimeoutBrokenServer(void* clientData);
 void beginQOSMeasurement();
 
 char const* progName;
@@ -58,9 +64,11 @@ Authenticator* ourAuthenticator = NULL;
 char const* streamURL = NULL;
 MediaSession* session = NULL;
 TaskToken sessionTimerTask = NULL;
+TaskToken sessionTimeoutBrokenServerTask = NULL;
 TaskToken arrivalCheckTimerTask = NULL;
 TaskToken interPacketGapCheckTimerTask = NULL;
 TaskToken qosMeasurementTimerTask = NULL;
+TaskToken periodicFileOutputTask = NULL;
 Boolean createReceivers = True;
 Boolean outputQuickTimeFile = False;
 Boolean generateMP4Format = False;
@@ -69,12 +77,14 @@ Boolean outputAVIFile = False;
 AVIFileSink* aviOut = NULL;
 Boolean audioOnly = False;
 Boolean videoOnly = False;
+Boolean applicationOnly = False;
 char const* singleMedium = NULL;
 int verbosityLevel = 1; // by default, print verbose output
 double duration = 0;
 double durationSlop = -1.0; // extra seconds to play at the end
 double initialSeekTime = 0.0f;
 char* initialAbsoluteSeekTime = NULL;
+char* initialAbsoluteSeekEndTime = NULL;
 float scale = 1.0f;
 double endTime;
 unsigned interPacketGapMaxTime = 0;
@@ -85,7 +95,10 @@ Boolean sendOptionsRequest = True;
 Boolean sendOptionsRequestOnly = False;
 Boolean oneFilePerFrame = False;
 Boolean notifyOnPacketArrival = False;
+Boolean sendKeepAlivesToBrokenServers = False;
+unsigned sessionTimeoutParameter = 0;
 Boolean streamUsingTCP = False;
+Boolean forceMulticastOnUnspecified = False;
 unsigned short desiredPortNum = 0;
 portNumBits tunnelOverHTTPPortNum = 0;
 char* username = NULL;
@@ -106,7 +119,17 @@ unsigned socketInputBufferSize = 0;
 Boolean packetLossCompensate = False;
 Boolean syncStreams = False;
 Boolean generateHintTracks = False;
+Boolean waitForResponseToTEARDOWN = True;
 unsigned qosMeasurementIntervalMS = 0; // 0 means: Don't output QOS data
+char* userAgent = NULL;
+unsigned fileOutputInterval = 0; // seconds
+unsigned fileOutputSecondsSoFar = 0; // seconds
+Boolean createHandlerServerForREGISTERCommand = False;
+portNumBits handlerServerForREGISTERCommandPortNum = 0;
+HandlerServerForREGISTERCommand* handlerServerForREGISTERCommand;
+char* usernameForREGISTER = NULL;
+char* passwordForREGISTER = NULL;
+UserAuthenticationDatabase* authDBForREGISTER = NULL;
 
 struct timeval startTime;
 
@@ -117,8 +140,10 @@ void usage() {
        << " [-u <username> <password>"
 	   << (allowProxyServers ? " [<proxy-server> [<proxy-server-port>]]" : "")
        << "]" << (supportCodecSelection ? " [-A <audio-codec-rtp-payload-format-code>|-M <mime-subtype-name>]" : "")
-       << " [-s <initial-seek-time>]|[-U <absolute-seek-time>] [-z <scale>]"
-       << " [-w <width> -h <height>] [-f <frames-per-second>] [-y] [-H] [-Q [<measurement-interval>]] [-F <filename-prefix>] [-b <file-sink-buffer-size>] [-B <input-socket-buffer-size>] [-I <input-interface-ip-address>] [-m] <url> (or " << progName << " -o [-V] <url>)\n";
+       << " [-s <initial-seek-time>]|[-U <absolute-seek-time>] [-E <absolute-seek-end-time>] [-z <scale>] [-g user-agent]"
+       << " [-k <username-for-REGISTER> <password-for-REGISTER>]"
+       << " [-P <interval-in-seconds>] [-K]"
+       << " [-w <width> -h <height>] [-f <frames-per-second>] [-y] [-H] [-Q [<measurement-interval>]] [-F <filename-prefix>] [-b <file-sink-buffer-size>] [-B <input-socket-buffer-size>] [-I <input-interface-ip-address>] [-m] [<url>|-R [<port-num>]] (or " << progName << " -o [-V] <url>)\n";
   shutdown();
 }
 
@@ -138,11 +163,14 @@ int main(int argc, char** argv) {
 #endif
 
   // unfortunately we can't use getopt() here, as Windoze doesn't have it
-  while (argc > 2) {
+  while (argc > 1) {
     char* const opt = argv[1];
-    if (opt[0] != '-') usage();
-    switch (opt[1]) {
+    if (opt[0] != '-') {
+      if (argc == 2) break; // only the URL is left
+      usage();
+    }
 
+    switch (opt[1]) {
     case 'p': { // specify start port number
       int portArg;
       if (sscanf(argv[2], "%d", &portArg) != 1) {
@@ -185,7 +213,16 @@ int main(int argc, char** argv) {
 	*env << "Failed to find network address for \"" << argv[2] << "\"";
 	break;
       }
-      ReceivingInterfaceAddr = *(unsigned*)(addresses.firstAddress()->data());
+
+      struct sockaddr_storage interfaceAddress;
+
+      copyAddress(interfaceAddress, addresses.firstAddress());
+      if (interfaceAddress.ss_family == AF_INET) {
+	ReceivingInterfaceAddr = ((sockaddr_in&)interfaceAddress).sin_addr.s_addr;
+      }
+      if (interfaceAddress.ss_family == AF_INET6) {
+    ReceivingInterfaceAddr6 = ((sockaddr_in6&)interfaceAddress).sin6_addr;
+      }
       ++argv; --argc;
       break;
     }
@@ -199,6 +236,12 @@ int main(int argc, char** argv) {
     case 'v': { // receive/record a video stream only
       videoOnly = True;
       singleMedium = "video";
+      break;
+    }
+
+    case 'L': { // receive/record an 'application' (e.g., metadata) stream only
+      applicationOnly = True;
+      singleMedium = "application";
       break;
     }
 
@@ -249,6 +292,16 @@ int main(int argc, char** argv) {
       break;
     }
 
+    case 'm': { // output multiple files - one for each frame
+      oneFilePerFrame = True;
+      break;
+    }
+
+    case 'n': { // notify the user when the first data packet arrives
+      notifyOnPacketArrival = True;
+      break;
+    }
+
     case 'O': { // Don't send an "OPTIONS" request before "DESCRIBE"
       sendOptionsRequest = False;
       break;
@@ -259,13 +312,13 @@ int main(int argc, char** argv) {
       break;
     }
 
-    case 'm': { // output multiple files - one for each frame
-      oneFilePerFrame = True;
-      break;
-    }
-
-    case 'n': { // notify the user when the first data packet arrives
-      notifyOnPacketArrival = True;
+    case 'P': { // specify an interval (in seconds) between writing successive output files
+      int fileOutputIntervalInt;
+      if (sscanf(argv[2], "%d", &fileOutputIntervalInt) != 1 || fileOutputIntervalInt <= 0) {
+	usage();
+      }
+      fileOutputInterval = (unsigned)fileOutputIntervalInt;
+      ++argv; --argc;
       break;
     }
 
@@ -320,6 +373,22 @@ int main(int argc, char** argv) {
       break;
     }
 
+    case 'k': { // specify a username and password to be used to authentication an incoming "REGISTER" command (for use with -R)
+      if (argc < 4) usage(); // there's no argv[3] (for the "password")
+      usernameForREGISTER = argv[2];
+      passwordForREGISTER = argv[3];
+      argv+=2; argc-=2;
+
+      if (authDBForREGISTER == NULL) authDBForREGISTER = new UserAuthenticationDatabase;
+      authDBForREGISTER->addUserRecord(usernameForREGISTER, passwordForREGISTER);
+      break;
+    }
+
+    case 'K': { // Send periodic 'keep-alive' requests to keep broken server sessions alive
+      sendKeepAlivesToBrokenServers = True;
+      break;
+    }
+
     case 'A': { // specify a desired audio RTP payload format
       unsigned formatArg;
       if (sscanf(argv[2], "%u", &formatArg) != 1
@@ -367,6 +436,12 @@ int main(int argc, char** argv) {
 
     case 'F': { // specify a prefix for the audio and video output files
       fileNamePrefix = argv[2];
+      ++argv; --argc;
+      break;
+    }
+
+    case 'g': { // specify a user agent name to use in outgoing requests
+      userAgent = argv[2];
       ++argv; --argc;
       break;
     }
@@ -429,12 +504,18 @@ int main(int argc, char** argv) {
     }
 
     case 'U': {
-      // specify initial absolute seek time (trick play), using a string of the form "YYYYMMDDTHHMMSSZ" or "YYYYMMDDTHHMMSS.<frac>Z
+      // specify initial absolute seek time (trick play), using a string of the form "YYYYMMDDTHHMMSSZ" or "YYYYMMDDTHHMMSS.<frac>Z"
       initialAbsoluteSeekTime = argv[2];
       ++argv; --argc;
       break;
     }
 
+    case 'E': {
+      // specify initial absolute seek END time (trick play), using a string of the form "YYYYMMDDTHHMMSSZ" or "YYYYMMDDTHHMMSS.<frac>Z"
+      initialAbsoluteSeekEndTime = argv[2];
+      ++argv; --argc;
+      break;
+    }
     case 'z': { // scale (trick play)
       float arg;
       if (sscanf(argv[2], "%g", &arg) != 1 || arg == 0.0f) {
@@ -445,7 +526,26 @@ int main(int argc, char** argv) {
       break;
     }
 
+    case 'R': {
+      // set up a handler server for incoming "REGISTER" commands
+      createHandlerServerForREGISTERCommand = True;
+      if (argc > 2 && argv[2][0] != '-') {
+	// The next argument is the REGISTER handler server port number:
+	if (sscanf(argv[2], "%hu", &handlerServerForREGISTERCommandPortNum) == 1 && handlerServerForREGISTERCommandPortNum > 0) {
+	  ++argv; --argc;
+	  break;
+	}
+      }
+      break;
+    }
+
+    case 'C': {
+      forceMulticastOnUnspecified = True;
+      break;
+    }
+
     default: {
+      *env << "Invalid option: " << opt << "\n";
       usage();
       break;
     }
@@ -453,14 +553,20 @@ int main(int argc, char** argv) {
 
     ++argv; --argc;
   }
-  if (argc != 2) usage(); // there must be exactly one "rtsp://" URL at the end
+
+  // There must be exactly one "rtsp://" URL at the end (unless '-R' was used, in which case there's no URL)
+  if (!( (argc == 2 && !createHandlerServerForREGISTERCommand) || (argc == 1 && createHandlerServerForREGISTERCommand) )) usage();
   if (outputQuickTimeFile && outputAVIFile) {
     *env << "The -i and -q (or -4) options cannot both be used!\n";
     usage();
   }
   Boolean outputCompositeFile = outputQuickTimeFile || outputAVIFile;
-  if (!createReceivers && outputCompositeFile) {
-    *env << "The -r and -q (or -4 or -i) options cannot both be used!\n";
+  if (!createReceivers && (outputCompositeFile || oneFilePerFrame || fileOutputInterval > 0)) {
+    *env << "The -r option cannot be used with -q, -4, -i, -m, or -P!\n";
+    usage();
+  }
+  if (oneFilePerFrame && fileOutputInterval > 0) {
+    *env << "The -m and -P options cannot both be used!\n";
     usage();
   }
   if (outputCompositeFile && !movieWidthOptionSet) {
@@ -479,12 +585,28 @@ int main(int argc, char** argv) {
     *env << "The -a and -v options cannot both be used!\n";
     usage();
   }
+  if (audioOnly && applicationOnly) {
+    *env << "The -a and -L options cannot both be used!\n";
+    usage();
+  }
+  if (videoOnly && applicationOnly) {
+    *env << "The -v and -L options cannot both be used!\n";
+    usage();
+  }
   if (sendOptionsRequestOnly && !sendOptionsRequest) {
     *env << "The -o and -O options cannot both be used!\n";
     usage();
   }
   if (initialAbsoluteSeekTime != NULL && initialSeekTime != 0.0f) {
     *env << "The -s and -U options cannot both be used!\n";
+    usage();
+  }
+  if (initialAbsoluteSeekTime == NULL && initialAbsoluteSeekEndTime != NULL) {
+    *env << "The -E option requires the -U option!\n";
+    usage();
+  }
+  if (authDBForREGISTER != NULL && !createHandlerServerForREGISTERCommand) {
+    *env << "If \"-k <username> <password>\" is used, then -R (or \"-R <port-num>\") must also be used!\n";
     usage();
   }
   if (tunnelOverHTTPPortNum > 0) {
@@ -507,13 +629,49 @@ int main(int argc, char** argv) {
 
   streamURL = argv[1];
 
-  // Create our client object:
-  ourClient = createClient(*env, streamURL, verbosityLevel, progName);
-  if (ourClient == NULL) {
-    *env << "Failed to create " << clientProtocolName
-		<< " client: " << env->getResultMsg() << "\n";
-    shutdown();
+  // Create (or arrange to create) our client object:
+  if (createHandlerServerForREGISTERCommand) {
+    handlerServerForREGISTERCommand
+      = HandlerServerForREGISTERCommand::createNew(*env, continueAfterClientCreation0,
+						   handlerServerForREGISTERCommandPortNum, authDBForREGISTER,
+						   verbosityLevel, progName);
+    if (handlerServerForREGISTERCommand == NULL) {
+      *env << "Failed to create a server for handling incoming \"REGISTER\" commands: " << env->getResultMsg() << "\n";
+      shutdown();
+    } else {
+      *env << "Awaiting an incoming \"REGISTER\" command on port " << handlerServerForREGISTERCommand->serverPortNum() << "\n";
+    }
+  } else {
+    ourClient = createClient(*env, streamURL, verbosityLevel, progName);
+    if (ourClient == NULL) {
+      *env << "Failed to create " << clientProtocolName << " client: " << env->getResultMsg() << "\n";
+      shutdown();
+    }
+    continueAfterClientCreation1();
   }
+
+  // All subsequent activity takes place within the event loop:
+  env->taskScheduler().doEventLoop(); // does not return
+
+  return 0; // only to prevent compiler warning
+}
+
+void continueAfterClientCreation0(RTSPClient* newRTSPClient, Boolean requestStreamingOverTCP) {
+  if (newRTSPClient == NULL) return;
+
+  streamUsingTCP = requestStreamingOverTCP;
+
+  assignClient(ourClient = newRTSPClient);
+  streamURL = newRTSPClient->url();
+
+  // Having handled one "REGISTER" command (giving us a "rtsp://" URL to stream from), we don't handle any more:
+  Medium::close(handlerServerForREGISTERCommand); handlerServerForREGISTERCommand = NULL;
+
+  continueAfterClientCreation1();
+}
+
+void continueAfterClientCreation1() {
+  setUserAgentString(userAgent);
 
   if (sendOptionsRequest) {
     // Begin by sending an "OPTIONS" command:
@@ -521,11 +679,6 @@ int main(int argc, char** argv) {
   } else {
     continueAfterOPTIONS(NULL, 0, NULL);
   }
-
-  // All subsequent activity takes place within the event loop:
-  env->taskScheduler().doEventLoop(); // does not return
-
-  return 0; // only to prevent compiler warning
 }
 
 void continueAfterOPTIONS(RTSPClient*, int resultCode, char* resultString) {
@@ -546,6 +699,7 @@ void continueAfterOPTIONS(RTSPClient*, int resultCode, char* resultString) {
 void continueAfterDESCRIBE(RTSPClient*, int resultCode, char* resultString) {
   if (resultCode != 0) {
     *env << "Failed to get a SDP description for the URL \"" << streamURL << "\": " << resultString << "\n";
+    delete[] resultString;
     shutdown();
   }
 
@@ -596,9 +750,14 @@ void continueAfterDESCRIBE(RTSPClient*, int resultCode, char* resultString) {
 	     << "\" subsession: " << env->getResultMsg() << "\n";
       } else {
 	*env << "Created receiver for \"" << subsession->mediumName()
-	     << "/" << subsession->codecName()
-	     << "\" subsession (client ports " << subsession->clientPortNum()
-	     << "-" << subsession->clientPortNum()+1 << ")\n";
+	     << "/" << subsession->codecName() << "\" subsession (";
+	if (subsession->rtcpIsMuxed()) {
+	  *env << "client port " << subsession->clientPortNum();
+	} else {
+	  *env << "client ports " << subsession->clientPortNum()
+	       << "-" << subsession->clientPortNum()+1;
+	}
+	*env << ")\n";
 	madeProgress = True;
 	
 	if (subsession->rtpSource() != NULL) {
@@ -647,21 +806,206 @@ void continueAfterDESCRIBE(RTSPClient*, int resultCode, char* resultString) {
 
 MediaSubsession *subsession;
 Boolean madeProgress = False;
-void continueAfterSETUP(RTSPClient*, int resultCode, char* resultString) {
+void continueAfterSETUP(RTSPClient* client, int resultCode, char* resultString) {
   if (resultCode == 0) {
       *env << "Setup \"" << subsession->mediumName()
 	   << "/" << subsession->codecName()
-	   << "\" subsession (client ports " << subsession->clientPortNum()
-	   << "-" << subsession->clientPortNum()+1 << ")\n";
+	   << "\" subsession (";
+      if (subsession->rtcpIsMuxed()) {
+	*env << "client port " << subsession->clientPortNum();
+      } else {
+	*env << "client ports " << subsession->clientPortNum()
+	     << "-" << subsession->clientPortNum()+1;
+      }
+      *env << ")\n";
       madeProgress = True;
   } else {
     *env << "Failed to setup \"" << subsession->mediumName()
 	 << "/" << subsession->codecName()
-	 << "\" subsession: " << env->getResultMsg() << "\n";
+	 << "\" subsession: " << resultString << "\n";
   }
+  delete[] resultString;
+
+  if (client != NULL) sessionTimeoutParameter = client->sessionTimeoutParameter();
 
   // Set up the next subsession, if any:
   setupStreams();
+}
+
+void createOutputFiles(char const* periodicFilenameSuffix) {
+  char outFileName[1000];
+
+  if (outputQuickTimeFile || outputAVIFile) {
+    if (periodicFilenameSuffix[0] == '\0') {
+      // Normally (unless the '-P <interval-in-seconds>' option was given) we output to 'stdout':
+      sprintf(outFileName, "stdout");
+    } else {
+      // Otherwise output to a type-specific file name, containing "periodicFilenameSuffix":
+      char const* prefix = fileNamePrefix[0] == '\0' ? "output" : fileNamePrefix;
+      snprintf(outFileName, sizeof outFileName, "%s%s.%s", prefix, periodicFilenameSuffix,
+	       outputAVIFile ? "avi" : generateMP4Format ? "mp4" : "mov");
+    }
+
+    if (outputQuickTimeFile) {
+      qtOut = QuickTimeFileSink::createNew(*env, *session, outFileName,
+					   fileSinkBufferSize,
+					   movieWidth, movieHeight,
+					   movieFPS,
+					   packetLossCompensate,
+					   syncStreams,
+					   generateHintTracks,
+					   generateMP4Format);
+      if (qtOut == NULL) {
+	*env << "Failed to create a \"QuickTimeFileSink\" for outputting to \""
+	     << outFileName << "\": " << env->getResultMsg() << "\n";
+	shutdown();
+      } else {
+	*env << "Outputting to the file: \"" << outFileName << "\"\n";
+      }
+      
+      qtOut->startPlaying(sessionAfterPlaying, NULL);
+    } else { // outputAVIFile
+      aviOut = AVIFileSink::createNew(*env, *session, outFileName,
+				      fileSinkBufferSize,
+				      movieWidth, movieHeight,
+				      movieFPS,
+				      packetLossCompensate);
+      if (aviOut == NULL) {
+	*env << "Failed to create an \"AVIFileSink\" for outputting to \""
+	     << outFileName << "\": " << env->getResultMsg() << "\n";
+	shutdown();
+      } else {
+	*env << "Outputting to the file: \"" << outFileName << "\"\n";
+      }
+      
+      aviOut->startPlaying(sessionAfterPlaying, NULL);
+    }
+  } else {
+    // Create and start "FileSink"s for each subsession:
+    madeProgress = False;
+    MediaSubsessionIterator iter(*session);
+    while ((subsession = iter.next()) != NULL) {
+      if (subsession->readSource() == NULL) continue; // was not initiated
+      
+      // Create an output file for each desired stream:
+      if (singleMedium == NULL || periodicFilenameSuffix[0] != '\0') {
+	// Output file name is
+	//     "<filename-prefix><medium_name>-<codec_name>-<counter><periodicFilenameSuffix>"
+	static unsigned streamCounter = 0;
+	snprintf(outFileName, sizeof outFileName, "%s%s-%s-%d%s",
+		 fileNamePrefix, subsession->mediumName(),
+		 subsession->codecName(), ++streamCounter, periodicFilenameSuffix);
+      } else {
+	// When outputting a single medium only, we output to 'stdout
+	// (unless the '-P <interval-in-seconds>' option was given):
+	sprintf(outFileName, "stdout");
+      }
+
+      FileSink* fileSink = NULL;
+      Boolean createOggFileSink = False; // by default
+      if (strcmp(subsession->mediumName(), "video") == 0) {
+	if (strcmp(subsession->codecName(), "H264") == 0) {
+	  // For H.264 video stream, we use a special sink that adds 'start codes',
+	  // and (at the start) the SPS and PPS NAL units:
+	  fileSink = H264VideoFileSink::createNew(*env, outFileName,
+						  subsession->fmtp_spropparametersets(),
+						  fileSinkBufferSize, oneFilePerFrame);
+	} else if (strcmp(subsession->codecName(), "H265") == 0) {
+	  // For H.265 video stream, we use a special sink that adds 'start codes',
+	  // and (at the start) the VPS, SPS, and PPS NAL units:
+	  fileSink = H265VideoFileSink::createNew(*env, outFileName,
+						  subsession->fmtp_spropvps(),
+						  subsession->fmtp_spropsps(),
+						  subsession->fmtp_sproppps(),
+						  fileSinkBufferSize, oneFilePerFrame);
+	} else if (strcmp(subsession->codecName(), "THEORA") == 0) {
+	  createOggFileSink = True;
+	}
+      } else if (strcmp(subsession->mediumName(), "audio") == 0) {
+	if (strcmp(subsession->codecName(), "AMR") == 0 ||
+	    strcmp(subsession->codecName(), "AMR-WB") == 0) {
+	  // For AMR audio streams, we use a special sink that inserts AMR frame hdrs:
+	  fileSink = AMRAudioFileSink::createNew(*env, outFileName,
+						 fileSinkBufferSize, oneFilePerFrame);
+	} else if (strcmp(subsession->codecName(), "VORBIS") == 0 ||
+		   strcmp(subsession->codecName(), "OPUS") == 0) {
+	  createOggFileSink = True;
+	} else if (strcmp(subsession->codecName(), "MPEG4-GENERIC") == 0) {
+	  // For AAC audio, we use a regular file sink, but add a 'ADTS framer' filter
+	  // to the end of the data source, so that the resulting file is playable:
+	  FramedFilter* adtsFramer
+	    = ADTSAudioStreamDiscreteFramer::createNew(*env, subsession->readSource(),
+						       subsession->fmtp_config());
+	  subsession->addFilter(adtsFramer);
+	}
+      }
+      if (createOggFileSink) {
+	fileSink = OggFileSink
+	  ::createNew(*env, outFileName,
+		      subsession->rtpTimestampFrequency(), subsession->fmtp_config());
+      } else if (fileSink == NULL) {
+	// Normal case:
+	fileSink = FileSink::createNew(*env, outFileName,
+				       fileSinkBufferSize, oneFilePerFrame);
+      }
+      subsession->sink = fileSink;
+
+      if (subsession->sink == NULL) {
+	*env << "Failed to create FileSink for \"" << outFileName
+	     << "\": " << env->getResultMsg() << "\n";
+      } else {
+	if (singleMedium == NULL) {
+	  *env << "Created output file: \"" << outFileName << "\"\n";
+	} else {
+	  *env << "Outputting data from the \"" << subsession->mediumName()
+	       << "/" << subsession->codecName()
+	       << "\" subsession to \"" << outFileName << "\"\n";
+	}
+	
+	if (strcmp(subsession->mediumName(), "video") == 0 &&
+	    strcmp(subsession->codecName(), "MP4V-ES") == 0 &&
+	    subsession->fmtp_config() != NULL) {
+	  // For MPEG-4 video RTP streams, the 'config' information
+	  // from the SDP description contains useful VOL etc. headers.
+	  // Insert this data at the front of the output file:
+	  unsigned configLen;
+	  unsigned char* configData
+	    = parseGeneralConfigStr(subsession->fmtp_config(), configLen);
+	  struct timeval timeNow;
+	  gettimeofday(&timeNow, NULL);
+	  fileSink->addData(configData, configLen, timeNow);
+	  delete[] configData;
+	}
+	
+	subsession->sink->startPlaying(*(subsession->readSource()),
+				       subsessionAfterPlaying,
+				       subsession);
+	
+	// Also set a handler to be called if a RTCP "BYE" arrives
+	// for this subsession:
+	if (subsession->rtcpInstance() != NULL) {
+	  subsession->rtcpInstance()->setByeWithReasonHandler(subsessionByeHandler, subsession);
+	}
+	
+	madeProgress = True;
+      }
+    }
+    if (!madeProgress) shutdown();
+  }
+}
+
+void createPeriodicOutputFiles() {
+  // Create a filename suffix that notes the time interval that's being recorded:
+  char periodicFileNameSuffix[100];
+  snprintf(periodicFileNameSuffix, sizeof periodicFileNameSuffix, "-%05d-%05d",
+	   fileOutputSecondsSoFar, fileOutputSecondsSoFar + fileOutputInterval);
+  createOutputFiles(periodicFileNameSuffix);
+
+  // Schedule an event for writing the next output file:
+  periodicFileOutputTask
+    = env->taskScheduler().scheduleDelayedTask(fileOutputInterval*1000000,
+					       (TaskFunc*)periodicFileOutputTimerHandler,
+					       (void*)NULL);
 }
 
 void setupStreams() {
@@ -671,7 +1015,7 @@ void setupStreams() {
     // We have another subsession left to set up:
     if (subsession->clientPortNum() == 0) continue; // port # was not set
 
-    setupSubsession(subsession, streamUsingTCP, continueAfterSETUP);
+    setupSubsession(subsession, streamUsingTCP, forceMulticastOnUnspecified, continueAfterSETUP);
     return;
   }
 
@@ -681,114 +1025,10 @@ void setupStreams() {
 
   // Create output files:
   if (createReceivers) {
-    if (outputQuickTimeFile) {
-      // Create a "QuickTimeFileSink", to write to 'stdout':
-      qtOut = QuickTimeFileSink::createNew(*env, *session, "stdout",
-					   fileSinkBufferSize,
-					   movieWidth, movieHeight,
-					   movieFPS,
-					   packetLossCompensate,
-					   syncStreams,
-					   generateHintTracks,
-					   generateMP4Format);
-      if (qtOut == NULL) {
-	*env << "Failed to create QuickTime file sink for stdout: " << env->getResultMsg();
-	shutdown();
-      }
-
-      qtOut->startPlaying(sessionAfterPlaying, NULL);
-    } else if (outputAVIFile) {
-      // Create an "AVIFileSink", to write to 'stdout':
-      aviOut = AVIFileSink::createNew(*env, *session, "stdout",
-				      fileSinkBufferSize,
-				      movieWidth, movieHeight,
-				      movieFPS,
-				      packetLossCompensate);
-      if (aviOut == NULL) {
-	*env << "Failed to create AVI file sink for stdout: " << env->getResultMsg();
-	shutdown();
-      }
-
-      aviOut->startPlaying(sessionAfterPlaying, NULL);
+    if (fileOutputInterval > 0) {
+      createPeriodicOutputFiles();
     } else {
-      // Create and start "FileSink"s for each subsession:
-      madeProgress = False;
-      MediaSubsessionIterator iter(*session);
-      while ((subsession = iter.next()) != NULL) {
-	if (subsession->readSource() == NULL) continue; // was not initiated
-
-	// Create an output file for each desired stream:
-	char outFileName[1000];
-	if (singleMedium == NULL) {
-	  // Output file name is
-	  //     "<filename-prefix><medium_name>-<codec_name>-<counter>"
-	  static unsigned streamCounter = 0;
-	  snprintf(outFileName, sizeof outFileName, "%s%s-%s-%d",
-		   fileNamePrefix, subsession->mediumName(),
-		   subsession->codecName(), ++streamCounter);
-	} else {
-	  sprintf(outFileName, "stdout");
-	}
-	FileSink* fileSink;
-	if (strcmp(subsession->mediumName(), "audio") == 0 &&
-	    (strcmp(subsession->codecName(), "AMR") == 0 ||
-	     strcmp(subsession->codecName(), "AMR-WB") == 0)) {
-	  // For AMR audio streams, we use a special sink that inserts AMR frame hdrs:
-	  fileSink = AMRAudioFileSink::createNew(*env, outFileName,
-						 fileSinkBufferSize, oneFilePerFrame);
-	} else if (strcmp(subsession->mediumName(), "video") == 0 &&
-	    (strcmp(subsession->codecName(), "H264") == 0)) {
-	  // For H.264 video stream, we use a special sink that insert start_codes:
-	  fileSink = H264VideoFileSink::createNew(*env, outFileName,
-						  subsession->fmtp_spropparametersets(),
-						  fileSinkBufferSize, oneFilePerFrame);
-	} else {
-	  // Normal case:
-	  fileSink = FileSink::createNew(*env, outFileName,
-					 fileSinkBufferSize, oneFilePerFrame);
-	}
-	subsession->sink = fileSink;
-	if (subsession->sink == NULL) {
-	  *env << "Failed to create FileSink for \"" << outFileName
-		  << "\": " << env->getResultMsg() << "\n";
-	} else {
-	  if (singleMedium == NULL) {
-	    *env << "Created output file: \"" << outFileName << "\"\n";
-	  } else {
-	    *env << "Outputting data from the \"" << subsession->mediumName()
-			<< "/" << subsession->codecName()
-			<< "\" subsession to 'stdout'\n";
-	  }
-
-	  if (strcmp(subsession->mediumName(), "video") == 0 &&
-	      strcmp(subsession->codecName(), "MP4V-ES") == 0 &&
-	      subsession->fmtp_config() != NULL) {
-	    // For MPEG-4 video RTP streams, the 'config' information
-	    // from the SDP description contains useful VOL etc. headers.
-	    // Insert this data at the front of the output file:
-	    unsigned configLen;
-	    unsigned char* configData
-	      = parseGeneralConfigStr(subsession->fmtp_config(), configLen);
-	    struct timeval timeNow;
-	    gettimeofday(&timeNow, NULL);
-	    fileSink->addData(configData, configLen, timeNow);
-	    delete[] configData;
-	  }
-
-	  subsession->sink->startPlaying(*(subsession->readSource()),
-					 subsessionAfterPlaying,
-					 subsession);
-
-	  // Also set a handler to be called if a RTCP "BYE" arrives
-	  // for this subsession:
-	  if (subsession->rtcpInstance() != NULL) {
-	    subsession->rtcpInstance()->setByeHandler(subsessionByeHandler, subsession);
-	  }
-
-	  madeProgress = True;
-	}
-      }
-      if (!madeProgress) shutdown();
+      createOutputFiles("");
     }
   }
 
@@ -809,9 +1049,10 @@ void setupStreams() {
   }
 
   char const* absStartTime = initialAbsoluteSeekTime != NULL ? initialAbsoluteSeekTime : session->absStartTime();
+  char const* absEndTime = initialAbsoluteSeekEndTime != NULL ? initialAbsoluteSeekEndTime : session->absEndTime();
   if (absStartTime != NULL) {
     // Either we or the server have specified that seeking should be done by 'absolute' time:
-    startPlayingSession(session, absStartTime, session->absEndTime(), scale, continueAfterPLAY);
+    startPlayingSession(session, absStartTime, absEndTime, scale, continueAfterPLAY);
   } else {
     // Normal case: Seek by relative time (NPT):
     startPlayingSession(session, initialSeekTime, endTime, scale, continueAfterPLAY);
@@ -821,10 +1062,13 @@ void setupStreams() {
 void continueAfterPLAY(RTSPClient*, int resultCode, char* resultString) {
   if (resultCode != 0) {
     *env << "Failed to start playing session: " << resultString << "\n";
+    delete[] resultString;
     shutdown();
+    return;
   } else {
     *env << "Started playing session\n";
   }
+  delete[] resultString;
 
   if (qosMeasurementIntervalMS > 0) {
     // Begin periodic QOS measurements:
@@ -866,14 +1110,17 @@ void continueAfterPLAY(RTSPClient*, int resultCode, char* resultString) {
 #endif
   }
 
+  sessionTimeoutBrokenServerTask = NULL;
+
   // Watch for incoming packets (if desired):
   checkForPacketArrival(NULL);
   checkInterPacketGaps(NULL);
+  checkSessionTimeoutBrokenServer(NULL);
 }
 
 void closeMediaSinks() {
-  Medium::close(qtOut);
-  Medium::close(aviOut);
+  Medium::close(qtOut); qtOut = NULL;
+  Medium::close(aviOut); aviOut = NULL;
 
   if (session == NULL) return;
   MediaSubsessionIterator iter(*session);
@@ -901,13 +1148,18 @@ void subsessionAfterPlaying(void* clientData) {
   sessionAfterPlaying();
 }
 
-void subsessionByeHandler(void* clientData) {
+void subsessionByeHandler(void* clientData, char const* reason) {
   struct timeval timeNow;
   gettimeofday(&timeNow, NULL);
   unsigned secsDiff = timeNow.tv_sec - startTime.tv_sec;
 
   MediaSubsession* subsession = (MediaSubsession*)clientData;
-  *env << "Received RTCP \"BYE\" on \"" << subsession->mediumName()
+  *env << "Received RTCP \"BYE\"";
+  if (reason != NULL) {
+    *env << " (reason:\"" << reason << "\")";
+    delete[] (char*)reason;
+  }
+  *env << " on \"" << subsession->mediumName()
 	<< "/" << subsession->codecName()
 	<< "\" subsession (after " << secsDiff
 	<< " seconds)\n";
@@ -923,7 +1175,9 @@ void sessionAfterPlaying(void* /*clientData*/) {
     // We've been asked to play the stream(s) over again.
     // First, reset state from the current session:
     if (env != NULL) {
+      // Keep this running:      env->taskScheduler().unscheduleDelayedTask(periodicFileOutputTask);
       env->taskScheduler().unscheduleDelayedTask(sessionTimerTask);
+      env->taskScheduler().unscheduleDelayedTask(sessionTimeoutBrokenServerTask);
       env->taskScheduler().unscheduleDelayedTask(arrivalCheckTimerTask);
       env->taskScheduler().unscheduleDelayedTask(interPacketGapCheckTimerTask);
       env->taskScheduler().unscheduleDelayedTask(qosMeasurementTimerTask);
@@ -938,6 +1192,17 @@ void sessionTimerHandler(void* /*clientData*/) {
   sessionTimerTask = NULL;
 
   sessionAfterPlaying();
+}
+
+void periodicFileOutputTimerHandler(void* /*clientData*/) {
+  periodicFileOutputTask = NULL;
+  fileOutputSecondsSoFar += fileOutputInterval;
+
+  // First, close the existing output files:
+  closeMediaSinks();
+
+  // Then, create new output files:
+  createPeriodicOutputFiles();
 }
 
 class qosMeasurementRecord {
@@ -986,8 +1251,7 @@ static void scheduleNextQOSMeasurement() {
   struct timeval timeNow;
   gettimeofday(&timeNow, NULL);
   unsigned timeNowUSecs = timeNow.tv_sec*1000000 + timeNow.tv_usec;
-  unsigned usecsToDelay = nextQOSMeasurementUSecs - timeNowUSecs;
-     // Note: This works even when nextQOSMeasurementUSecs wraps around
+  int usecsToDelay = nextQOSMeasurementUSecs - timeNowUSecs;
 
   qosMeasurementTimerTask = env->taskScheduler().scheduleDelayedTask(
      usecsToDelay, (TaskFunc*)periodicQOSMeasurement, (void*)NULL);
@@ -1155,7 +1419,9 @@ void shutdown(int exitCode) {
 
   shutdownExitCode = exitCode;
   if (env != NULL) {
+    env->taskScheduler().unscheduleDelayedTask(periodicFileOutputTask);
     env->taskScheduler().unscheduleDelayedTask(sessionTimerTask);
+    env->taskScheduler().unscheduleDelayedTask(sessionTimeoutBrokenServerTask);
     env->taskScheduler().unscheduleDelayedTask(arrivalCheckTimerTask);
     env->taskScheduler().unscheduleDelayedTask(interPacketGapCheckTimerTask);
     env->taskScheduler().unscheduleDelayedTask(qosMeasurementTimerTask);
@@ -1166,20 +1432,29 @@ void shutdown(int exitCode) {
   }
 
   // Teardown, then shutdown, any outstanding RTP/RTCP subsessions
+  Boolean shutdownImmediately = True; // by default
   if (session != NULL) {
-    tearDownSession(session, continueAfterTEARDOWN);
-  } else {
-    continueAfterTEARDOWN(NULL, 0, NULL);
+    RTSPClient::responseHandler* responseHandlerForTEARDOWN = NULL; // unless:
+    if (waitForResponseToTEARDOWN) {
+      shutdownImmediately = False;
+      responseHandlerForTEARDOWN = continueAfterTEARDOWN;
+    }
+    tearDownSession(session, responseHandlerForTEARDOWN);
   }
+
+  if (shutdownImmediately) continueAfterTEARDOWN(NULL, 0, NULL);
 }
 
-void continueAfterTEARDOWN(RTSPClient*, int /*resultCode*/, char* /*resultString*/) {
+void continueAfterTEARDOWN(RTSPClient*, int /*resultCode*/, char* resultString) {
+  delete[] resultString;
+
   // Now that we've stopped any more incoming data from arriving, close our output files:
   closeMediaSinks();
   Medium::close(session);
 
   // Finally, shut down our client:
   delete ourAuthenticator;
+  delete authDBForREGISTER;
   Medium::close(ourClient);
 
   // Adios...
@@ -1188,10 +1463,12 @@ void continueAfterTEARDOWN(RTSPClient*, int /*resultCode*/, char* /*resultString
 
 void signalHandlerShutdown(int /*sig*/) {
   *env << "Got shutdown signal\n";
+  waitForResponseToTEARDOWN = False; // to ensure that we end, even if the server does not respond to our TEARDOWN
   shutdown(0);
 }
 
 void checkForPacketArrival(void* /*clientData*/) {
+  arrivalCheckTimerTask = NULL;
   if (!notifyOnPacketArrival) return; // we're not checking
 
   // Check each subsession, to see whether it has received data packets:
@@ -1250,6 +1527,7 @@ void checkForPacketArrival(void* /*clientData*/) {
 }
 
 void checkInterPacketGaps(void* /*clientData*/) {
+  interPacketGapCheckTimerTask = NULL;
   if (interPacketGapMaxTime == 0) return; // we're not checking
 
   // Check each subsession, counting up how many packets have been received:
@@ -1276,4 +1554,22 @@ void checkInterPacketGaps(void* /*clientData*/) {
       = env->taskScheduler().scheduleDelayedTask(interPacketGapMaxTime*1000000,
 				 (TaskFunc*)checkInterPacketGaps, NULL);
   }
+}
+
+void checkSessionTimeoutBrokenServer(void* /*clientData*/) {
+  if (!sendKeepAlivesToBrokenServers) return; // we're not checking
+
+  // Send an "OPTIONS" request, starting with the second call
+  if (sessionTimeoutBrokenServerTask != NULL) {
+    getOptions(NULL);
+  }
+  
+  unsigned sessionTimeout = sessionTimeoutParameter == 0 ? 60/*default*/ : sessionTimeoutParameter;
+  unsigned secondsUntilNextKeepAlive = sessionTimeout <= 5 ? 1 : sessionTimeout - 5;
+      // Reduce the interval a little, to be on the safe side
+
+  sessionTimeoutBrokenServerTask 
+    = env->taskScheduler().scheduleDelayedTask(secondsUntilNextKeepAlive*1000000,
+			 (TaskFunc*)checkSessionTimeoutBrokenServer, NULL);
+					       
 }
