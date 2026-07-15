@@ -1,7 +1,7 @@
 /**********
 This library is free software; you can redistribute it and/or modify it under
 the terms of the GNU Lesser General Public License as published by the
-Free Software Foundation; either version 2.1 of the License, or (at your
+Free Software Foundation; either version 3 of the License, or (at your
 option) any later version. (See <http://www.gnu.org/copyleft/lesser.html>.)
 
 This library is distributed in the hope that it will be useful, but WITHOUT
@@ -14,7 +14,7 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 **********/
 // "liveMedia"
-// Copyright (c) 1996-2012 Live Networks, Inc.  All rights reserved.
+// Copyright (c) 1996-2026 Live Networks, Inc.  All rights reserved.
 // A filter that passes through (unchanged) chunks that contain an integral number
 // of MPEG-2 Transport Stream packets, but returning (in "fDurationInMicroseconds")
 // an updated estimate of the time gap between chunks.
@@ -104,7 +104,7 @@ void MPEG2TransportStreamFramer::setPCRLimit(float pcrLimit) {
 void MPEG2TransportStreamFramer::doGetNextFrame() {
   if (fLimitNumTSPacketsToStream) {
     if (fNumTSPacketsToStream == 0) {
-      handleClosure(this);
+      handleClosure();
       return;
     }
     if (fNumTSPacketsToStream*TRANSPORT_PACKET_SIZE < fMaxSize) {
@@ -146,7 +146,7 @@ void MPEG2TransportStreamFramer::afterGettingFrame1(unsigned frameSize,
   fFrameSize = numTSPackets*TRANSPORT_PACKET_SIZE; // an integral # of TS packets
   if (fFrameSize == 0) {
     // We didn't read a complete TS packet; assume that the input source has closed.
-    handleClosure(this);
+    handleClosure();
     return;
   }
 
@@ -157,7 +157,7 @@ void MPEG2TransportStreamFramer::afterGettingFrame1(unsigned frameSize,
   }
   if (syncBytePosition == fFrameSize) {
     envir() << "No Transport Stream sync byte in data.";
-    handleClosure(this);
+    handleClosure();
     return;
   } else if (syncBytePosition > 0) {
     // There's a sync byte, but not at the start of the data.  Move the good data
@@ -180,7 +180,7 @@ void MPEG2TransportStreamFramer::afterGettingFrame1(unsigned frameSize,
   for (unsigned i = 0; i < numTSPackets; ++i) {
     if (!updateTSPacketDurationEstimate(&fTo[i*TRANSPORT_PACKET_SIZE], timeNow)) {
       // We hit a preset limit (based on PCR) within the stream.  Handle this as if the input source has closed:
-      handleClosure(this);
+      handleClosure();
       return;
     }
   }
@@ -257,7 +257,8 @@ Boolean MPEG2TransportStreamFramer::updateTSPacketDurationEstimate(unsigned char
 
     if (fTSPacketDurationEstimate == 0.0) { // we've just started
       fTSPacketDurationEstimate = durationPerPacket;
-    } else if (discontinuity_indicator == 0 && durationPerPacket >= 0.0) {
+    } else if (discontinuity_indicator == 0 && durationPerPacket >= 0.0
+	       && durationPerPacket < 2*fTSPacketDurationEstimate) {
       fTSPacketDurationEstimate
 	= durationPerPacket*NEW_DURATION_WEIGHT
 	+ fTSPacketDurationEstimate*(1-NEW_DURATION_WEIGHT);

@@ -1,7 +1,7 @@
 /**********
 This library is free software; you can redistribute it and/or modify it under
 the terms of the GNU Lesser General Public License as published by the
-Free Software Foundation; either version 2.1 of the License, or (at your
+Free Software Foundation; either version 3 of the License, or (at your
 option) any later version. (See <http://www.gnu.org/copyleft/lesser.html>.)
 
 This library is distributed in the hope that it will be useful, but WITHOUT
@@ -11,21 +11,23 @@ more details.
 
 You should have received a copy of the GNU Lesser General Public License
 along with this library; if not, write to the Free Software Foundation, Inc.,
-59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
 **********/
-// Copyright (c) 1996-2012, Live Networks, Inc.  All rights reserved
+// Copyright (c) 1996-2026, Live Networks, Inc.  All rights reserved
 // A test program that reads a H.264 Elementary Stream video file
 // and streams it using RTP
 // main program
 //
 // NOTE: For this application to work, the H.264 Elementary Stream video file *must* contain SPS and PPS NAL units,
-// ideally at or near the start of the file.  THese SPS and PPS NAL units are used to specify 'configuration' information
+// ideally at or near the start of the file.  These SPS and PPS NAL units are used to specify 'configuration' information
 // that is set in the output stream's SDP description (by the RTSP server that is built in to this application).
 // Note also that - unlike some other "*Streamer" demo applications - the resulting stream can be received only using a
 // RTSP client (such as "openRTSP")
 
 #include <liveMedia.hh>
+
 #include <BasicUsageEnvironment.hh>
+#include "announceURL.hh"
 #include <GroupsockHelper.hh>
 
 UsageEnvironment* env;
@@ -41,8 +43,9 @@ int main(int argc, char** argv) {
   env = BasicUsageEnvironment::createNew(*scheduler);
 
   // Create 'groupsocks' for RTP and RTCP:
-  struct in_addr destinationAddress;
-  destinationAddress.s_addr = chooseRandomIPv4SSMAddress(*env);
+  struct sockaddr_storage destinationAddress;
+  destinationAddress.ss_family = AF_INET;
+  ((struct sockaddr_in&)destinationAddress).sin_addr.s_addr = chooseRandomIPv4SSMAddress(*env);
   // Note: This is a multicast address.  If you wish instead to stream
   // using unicast, then you should use the "testOnDemandRTSPServer"
   // test program - not this test program - as a model.
@@ -87,10 +90,7 @@ int main(int argc, char** argv) {
 					   True /*SSM*/);
   sms->addSubsession(PassiveServerMediaSubsession::createNew(*videoSink, rtcp));
   rtspServer->addServerMediaSession(sms);
-
-  char* url = rtspServer->rtspURL(sms);
-  *env << "Play this stream using the URL \"" << url << "\"\n";
-  delete[] url;
+  announceURL(rtspServer, sms);
 
   // Start the streaming:
   *env << "Beginning streaming...\n";

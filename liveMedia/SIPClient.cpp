@@ -1,7 +1,7 @@
 /**********
 This library is free software; you can redistribute it and/or modify it under
 the terms of the GNU Lesser General Public License as published by the
-Free Software Foundation; either version 2.1 of the License, or (at your
+Free Software Foundation; either version 3 of the License, or (at your
 option) any later version. (See <http://www.gnu.org/copyleft/lesser.html>.)
 
 This library is distributed in the hope that it will be useful, but WITHOUT
@@ -14,7 +14,7 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 **********/
 // "liveMedia"
-// Copyright (c) 1996-2012 Live Networks, Inc.  All rights reserved.
+// Copyright (c) 1996-2026 Live Networks, Inc.  All rights reserved.
 // A generic SIP client
 // Implementation
 
@@ -38,6 +38,18 @@ SIPClient* SIPClient
 		       verbosityLevel, applicationName);
 }
 
+void SIPClient::setUserAgentString(char const* userAgentName) {
+  if (userAgentName == NULL) return;
+
+  // Change the existing user agent header string:
+  char const* const formatStr = "User-Agent: %s\r\n";
+  unsigned const headerSize = strlen(formatStr) + strlen(userAgentName);
+  delete[] fUserAgentHeaderStr;
+  fUserAgentHeaderStr = new char[headerSize];
+  sprintf(fUserAgentHeaderStr, formatStr, userAgentName);
+  fUserAgentHeaderStrLen = strlen(fUserAgentHeaderStr);
+}
+
 SIPClient::SIPClient(UsageEnvironment& env,
 		     unsigned char desiredAudioRTPPayloadFormat,
 		     char const* mimeSubtype,
@@ -45,11 +57,13 @@ SIPClient::SIPClient(UsageEnvironment& env,
   : Medium(env),
     fT1(500000 /* 500 ms */),
     fDesiredAudioRTPPayloadFormat(desiredAudioRTPPayloadFormat),
-    fVerbosityLevel(verbosityLevel),
-    fCSeq(0), fURL(NULL), fURLSize(0),
+    fVerbosityLevel(verbosityLevel), fCSeq(0),
+    fUserAgentHeaderStr(NULL), fUserAgentHeaderStrLen(0),
+    fURL(NULL), fURLSize(0),
     fToTagStr(NULL), fToTagStrSize(0),
     fUserName(NULL), fUserNameSize(0),
-    fInviteSDPDescription(NULL), fInviteCmd(NULL), fInviteCmdSize(0){
+    fInviteSDPDescription(NULL), fInviteSDPDescriptionReturned(NULL),
+    fInviteCmd(NULL), fInviteCmdSize(0) {
   if (mimeSubtype == NULL) mimeSubtype = "";
   fMIMESubtype = strDup(mimeSubtype);
   fMIMESubtypeSize = strlen(fMIMESubtype);
@@ -58,8 +72,9 @@ SIPClient::SIPClient(UsageEnvironment& env,
   fApplicationName = strDup(applicationName);
   fApplicationNameSize = strlen(fApplicationName);
 
-  struct in_addr ourAddress;
-  ourAddress.s_addr = ourIPAddress(env); // hack
+  struct sockaddr_storage ourAddress;
+  ourAddress.ss_family = AF_INET; // Later, fix to support IPv6
+  ((struct sockaddr_in&)ourAddress).sin_addr.s_addr = ourIPv4Address(env);
   fOurAddressStr = strDup(AddressString(ourAddress).val());
   fOurAddressStrSize = strlen(fOurAddressStr);
 
@@ -72,9 +87,9 @@ SIPClient::SIPClient(UsageEnvironment& env,
 
   // Now, find out our source port number.  Hack: Do this by first trying to
   // send a 0-length packet, so that the "getSourcePort()" call will work.
-  fOurSocket->output(envir(), 255, (unsigned char*)"", 0);
+  fOurSocket->output(envir(), (unsigned char*)"", 0);
   Port srcPort(0);
-  getSourcePort(env, fOurSocket->socketNum(), srcPort);
+  getSourcePort(env, fOurSocket->socketNum(), AF_INET, srcPort); // later, allow for IPv6
   if (srcPort.num() != 0) {
     fOurPortNum = ntohs(srcPort.num());
   } else {
@@ -90,13 +105,8 @@ SIPClient::SIPClient(UsageEnvironment& env,
     }
   }
 
-  // Set various headers to be used in each request:
-  char const* formatStr;
-  unsigned headerSize;
-
-  // Set the "User-Agent:" header:
+  // Set the "User-Agent:" header to use in each request:
   char const* const libName = "LIVE555 Streaming Media v";
-  char const* const libVersionStr = LIVEMEDIA_LIBRARY_VERSION_STRING;
   char const* libPrefix; char const* libSuffix;
   if (applicationName == NULL || applicationName[0] == '\0') {
     applicationName = libPrefix = libSuffix = "";
@@ -104,14 +114,13 @@ SIPClient::SIPClient(UsageEnvironment& env,
     libPrefix = " (";
     libSuffix = ")";
   }
-  formatStr = "User-Agent: %s%s%s%s%s\r\n";
-  headerSize
-    = strlen(formatStr) + fApplicationNameSize + strlen(libPrefix)
-    + strlen(libName) + strlen(libVersionStr) + strlen(libSuffix);
-  fUserAgentHeaderStr = new char[headerSize];
-  sprintf(fUserAgentHeaderStr, formatStr,
-	  applicationName, libPrefix, libName, libVersionStr, libSuffix);
-  fUserAgentHeaderStrSize = strlen(fUserAgentHeaderStr);
+  unsigned userAgentNameSize
+    = fApplicationNameSize + strlen(libPrefix) + strlen(libName) + strlen(liveMediaLibraryVersionStr) + strlen(libSuffix) + 1;
+  char* userAgentName = new char[userAgentNameSize];
+  sprintf(userAgentName, "%s%s%s%s%s",
+	  applicationName, libPrefix, libName, liveMediaLibraryVersionStr, libSuffix);
+  setUserAgentString(userAgentName);
+  delete[] userAgentName;
 
   reset();
 }
@@ -138,17 +147,19 @@ void SIPClient::reset() {
 
   delete[] (char*)fToTagStr; fToTagStr = NULL; fToTagStrSize = 0;
   fServerPortNum = 0;
-  fServerAddress.s_addr = 0;
+  fServerAddressIsSet = False;
   delete[] (char*)fURL; fURL = NULL; fURLSize = 0;
 }
 
-void SIPClient::setProxyServer(unsigned proxyServerAddress,
+void SIPClient::setProxyServer(struct sockaddr_storage const& proxyServerAddress,
 			       portNumBits proxyServerPortNum) {
-  fServerAddress.s_addr = proxyServerAddress;
+  fServerAddress = proxyServerAddress;
+  fServerAddressIsSet = True;
+
   fServerPortNum = proxyServerPortNum;
+
   if (fOurSocket != NULL) {
-    fOurSocket->changeDestinationParameters(fServerAddress,
-					    fServerPortNum, 255);
+    fOurSocket->changeDestinationParameters(fServerAddress, fServerPortNum, 255);
   }
 }
 
@@ -217,8 +228,10 @@ char* SIPClient::invite1(Authenticator* authenticator) {
     char const* const inviteSDPFmt =
       "v=0\r\n"
       "o=- %u %u IN IP4 %s\r\n"
+          // Later, use "IP6" if our address is IPv6-only
       "s=%s session\r\n"
       "c=IN IP4 %s\r\n"
+          // Later, use "IP6" if our address is IPv6-only
       "t=0 0\r\n"
       "m=audio %u RTP/AVP %u\r\n"
       "%s";
@@ -243,6 +256,7 @@ char* SIPClient::invite1(Authenticator* authenticator) {
       "INVITE %s SIP/2.0\r\n"
       "From: %s <sip:%s@%s>;tag=%u\r\n"
       "Via: SIP/2.0/UDP %s:%u\r\n"
+      "Max-Forwards: 70\r\n"
       "To: %s\r\n"
       "Contact: sip:%s@%s:%u\r\n"
       "Call-ID: %u@%s\r\n"
@@ -261,7 +275,7 @@ char* SIPClient::invite1(Authenticator* authenticator) {
       + 20 + fOurAddressStrSize
       + 20
       + strlen(authenticatorStr)
-      + fUserAgentHeaderStrSize
+      + fUserAgentHeaderStrLen
       + 20
       + inviteSDPSize;
     delete[] fInviteCmd; fInviteCmd = new char[inviteCmdSize];
@@ -329,6 +343,7 @@ unsigned const timerDFires = 0xDDDDDDDD;
 
 void SIPClient::timerAHandler(void* clientData) {
   SIPClient* client = (SIPClient*)clientData;
+  client->fTimerA = NULL;
   if (client->fVerbosityLevel >= 1) {
     client->envir() << "RETRANSMISSION " << ++client->fTimerACount
 		    << ", after " << client->fTimerALen/1000000.0
@@ -339,6 +354,7 @@ void SIPClient::timerAHandler(void* clientData) {
 
 void SIPClient::timerBHandler(void* clientData) {
   SIPClient* client = (SIPClient*)clientData;
+  client->fTimerB = NULL;
   if (client->fVerbosityLevel >= 1) {
     client->envir() << "RETRANSMISSION TIMEOUT, after "
 		    << 64*client->fT1/1000000.0 << " seconds\n";
@@ -349,6 +365,7 @@ void SIPClient::timerBHandler(void* clientData) {
 
 void SIPClient::timerDHandler(void* clientData) {
   SIPClient* client = (SIPClient*)clientData;
+  client->fTimerD = NULL;
   if (client->fVerbosityLevel >= 1) {
     client->envir() << "TIMER D EXPIRED\n";
   }
@@ -432,6 +449,7 @@ void SIPClient::doInviteStateTerminated(unsigned responseCode) {
   if (responseCode < 200 || responseCode > 299) {
     // We failed, so return NULL;
     delete[] fInviteSDPDescription; fInviteSDPDescription = NULL;
+    delete[] fInviteSDPDescriptionReturned; fInviteSDPDescriptionReturned = NULL;
   }
 
   // Unblock the event loop:
@@ -471,7 +489,7 @@ unsigned SIPClient::getResponseCode() {
 	  && fWorkingAuthenticator != NULL) {
 	// We have an authentication failure, so fill in
 	// "*fWorkingAuthenticator" using the contents of a following
-	// "Proxy-Authenticate:" line.  (Once we compute a 'response' for
+	// "Proxy-Authenticate:" or "WWW-Authenticate:" line.  (Once we compute a 'response' for
 	// "fWorkingAuthenticator", it can be used in a subsequent request
 	// - that will hopefully succeed.)
 	char* lineStart;
@@ -491,6 +509,8 @@ unsigned SIPClient::getResponseCode() {
 	  if (
 	      // Asterisk #####
 	      sscanf(lineStart, "Proxy-Authenticate: Digest realm=\"%[^\"]\", nonce=\"%[^\"]\"",
+		     realm, nonce) == 2 ||
+	      sscanf(lineStart, "WWW-Authenticate: Digest realm=\"%[^\"]\", nonce=\"%[^\"]\"",
 		     realm, nonce) == 2 ||
 	      // Cisco ATA #####
 	      sscanf(lineStart, "Proxy-Authenticate: Digest algorithm=MD5,domain=\"%*[^\"]\",nonce=\"%[^\"]\", realm=\"%[^\"]\"",
@@ -575,11 +595,11 @@ unsigned SIPClient::getResponseCode() {
         while (numExtraBytesNeeded > 0) {
           char* ptr = &readBuf[bytesRead];
 	  unsigned bytesRead2;
-	  struct sockaddr_in fromAddr;
+	  struct sockaddr_storage dummy; // not used
 	  Boolean readSuccess
 	    = fOurSocket->handleRead((unsigned char*)ptr,
 				     numExtraBytesNeeded,
-				     bytesRead2, fromAddr);
+				     bytesRead2, dummy);
           if (!readSuccess) break;
           ptr[bytesRead2] = '\0';
           if (fVerbosityLevel >= 1) {
@@ -595,6 +615,7 @@ unsigned SIPClient::getResponseCode() {
       }
 
       bodyStart[contentLength] = '\0'; // trims any extra data
+      delete[] fInviteSDPDescriptionReturned; fInviteSDPDescriptionReturned = strDup(bodyStart);
     }
   } while (0);
 
@@ -636,6 +657,7 @@ Boolean SIPClient::sendACK() {
       "ACK %s SIP/2.0\r\n"
       "From: %s <sip:%s@%s>;tag=%u\r\n"
       "Via: SIP/2.0/UDP %s:%u\r\n"
+      "Max-Forwards: 70\r\n"
       "To: %s;tag=%s\r\n"
       "Call-ID: %u@%s\r\n"
       "CSeq: %d ACK\r\n"
@@ -677,6 +699,7 @@ Boolean SIPClient::sendBYE() {
       "BYE %s SIP/2.0\r\n"
       "From: %s <sip:%s@%s>;tag=%u\r\n"
       "Via: SIP/2.0/UDP %s:%u\r\n"
+      "Max-Forwards: 70\r\n"
       "To: %s;tag=%s\r\n"
       "Call-ID: %u@%s\r\n"
       "CSeq: %d BYE\r\n"
@@ -714,14 +737,14 @@ Boolean SIPClient::processURL(char const* url) {
   do {
     // If we don't already have a server address/port, then
     // get these by parsing the URL:
-    if (fServerAddress.s_addr == 0) {
+    if (!fServerAddressIsSet) {
       NetAddress destAddress;
       if (!parseSIPURL(envir(), url, destAddress, fServerPortNum)) break;
-      fServerAddress.s_addr = *(unsigned*)(destAddress.data());
+      copyAddress(fServerAddress, &destAddress);
+      fServerAddressIsSet = True;
 
       if (fOurSocket != NULL) {
-	fOurSocket->changeDestinationParameters(fServerAddress,
-						fServerPortNum, 255);
+	fOurSocket->changeDestinationParameters(fServerAddress, fServerPortNum, 255);
       }
     }
 
@@ -735,7 +758,7 @@ Boolean SIPClient::parseSIPURL(UsageEnvironment& env, char const* url,
 			       NetAddress& address,
 			       portNumBits& portNum) {
   do {
-    // Parse the URL as "sip:<username>@<address>:<port>/<etc>"
+    // Parse the URL as "sip:<username>@<server-name-or-address>:<port>/<etc>"
     // (with ":<port>" and "/<etc>" optional)
     // Also, skip over any "<username>[:<password>]@" preceding <address>
     char const* prefix = "sip:";
@@ -762,13 +785,23 @@ Boolean SIPClient::parseSIPURL(UsageEnvironment& env, char const* url,
       ++from1;
     }
 
+    // Next, parse <server-address-or-name>
     char* to = &parseBuffer[0];
+    Boolean isInSquareBrackets = False; //  by default
+    if (*from == '[') {
+      ++from;
+      isInSquareBrackets = True;
+    }
     unsigned i;
     for (i = 0; i < parseBufferSize; ++i) {
-      if (*from == '\0' || *from == ':' || *from == '/') {
-	// We've completed parsing the address
-	*to = '\0';
-	break;
+      if (*from == '\0' ||
+          (*from == ':' && !isInSquareBrackets) ||
+          *from == '/' ||
+          (*from == ']' && isInSquareBrackets)) {
+        // We've completed parsing the address
+        *to = '\0';
+        if (*from == ']' && isInSquareBrackets) ++from;
+        break;
       }
       *to++ = *from++;
     }
@@ -854,7 +887,7 @@ SIPClient::createAuthenticatorString(Authenticator const* authenticator,
       && authenticator->password() != NULL) {
     // We've been provided a filled-in authenticator, so use it:
     char const* const authFmt
-      = "Proxy-Authorization: Digest username=\"%s\", realm=\"%s\", nonce=\"%s\", response=\"%s\", uri=\"%s\"\r\n";
+      = "Authorization: Digest username=\"%s\", realm=\"%s\", nonce=\"%s\", response=\"%s\", uri=\"%s\"\r\n";
     char const* response = authenticator->computeDigestResponse(cmd, url);
     unsigned authBufSize = strlen(authFmt)
       + strlen(authenticator->username()) + strlen(authenticator->realm())
@@ -878,8 +911,7 @@ Boolean SIPClient::sendRequest(char const* requestString,
   }
   // NOTE: We should really check that "requestLength" is not #####
   // too large for UDP (see RFC 3261, section 18.1.1) #####
-  return fOurSocket->output(envir(), 255, (unsigned char*)requestString,
-			    requestLength);
+  return fOurSocket->output(envir(), (unsigned char*)requestString, requestLength);
 }
 
 unsigned SIPClient::getResponse(char*& responseBuffer,
@@ -895,11 +927,11 @@ unsigned SIPClient::getResponse(char*& responseBuffer,
   int bytesRead = 0;
   while (bytesRead < (int)responseBufferSize) {
     unsigned bytesReadNow;
-    struct sockaddr_in fromAddr;
+    struct sockaddr_storage dummy; // not used
     unsigned char* toPosn = (unsigned char*)(responseBuffer+bytesRead);
     Boolean readSuccess
       = fOurSocket->handleRead(toPosn, responseBufferSize-bytesRead,
-			       bytesReadNow, fromAddr);
+			       bytesReadNow, dummy);
     if (!readSuccess || bytesReadNow == 0) {
       envir().setResultMsg("SIP response was truncated");
       break;

@@ -1,7 +1,7 @@
 /**********
 This library is free software; you can redistribute it and/or modify it under
 the terms of the GNU Lesser General Public License as published by the
-Free Software Foundation; either version 2.1 of the License, or (at your
+Free Software Foundation; either version 3 of the License, or (at your
 option) any later version. (See <http://www.gnu.org/copyleft/lesser.html>.)
 
 This library is distributed in the hope that it will be useful, but WITHOUT
@@ -65,7 +65,7 @@ void WindowsAudioInputDevice_common::doGetNextFrame() {
 
 void WindowsAudioInputDevice_common::doStopGettingFrames() {
   // Turn off the audio poller:
-  envir().taskScheduler().unscheduleDelayedTask(nextTask()); nextTask() = NULL;
+  envir().taskScheduler().unscheduleDelayedTask(nextTask());
 }
 
 double WindowsAudioInputDevice_common::getAverageLevel() const {
@@ -100,6 +100,7 @@ void WindowsAudioInputDevice_common::audioReadyPoller(void* clientData) {
 }
 
 void WindowsAudioInputDevice_common::audioReadyPoller1() {
+  nextTask() = NULL;
   if (readHead != NULL) {
     onceAudioIsReady();
   } else {

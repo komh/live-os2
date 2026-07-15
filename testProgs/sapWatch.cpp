@@ -1,7 +1,7 @@
 /**********
 This library is free software; you can redistribute it and/or modify it under
 the terms of the GNU Lesser General Public License as published by the
-Free Software Foundation; either version 2.1 of the License, or (at your
+Free Software Foundation; either version 3 of the License, or (at your
 option) any later version. (See <http://www.gnu.org/copyleft/lesser.html>.)
 
 This library is distributed in the hope that it will be useful, but WITHOUT
@@ -13,7 +13,7 @@ You should have received a copy of the GNU Lesser General Public License
 along with this library; if not, write to the Free Software Foundation, Inc.,
 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 **********/
-// Copyright (c) 1996-2012, Live Networks, Inc.  All rights reserved
+// Copyright (c) 1996-2026, Live Networks, Inc.  All rights reserved
 // A program that receives and prints SDP/SAP announcements
 // (on the default SDP/SAP directory: 224.2.127.254/9875)
 
@@ -33,8 +33,9 @@ int main(int argc, char** argv) {
 
   // Create a 'groupsock' for the input multicast group,port:
   char const* sessionAddressStr = "224.2.127.254";
-  struct in_addr sessionAddress;
-  sessionAddress.s_addr = our_inet_addr(sessionAddressStr);
+  NetAddressList sessionAddresses(sessionAddressStr);
+  struct sockaddr_storage sessionAddress;
+  copyAddress(sessionAddress, sessionAddresses.firstAddress());
 
   const Port port(9875);
   const unsigned char ttl = 0; // we're only reading from this mcast group
@@ -46,7 +47,7 @@ int main(int argc, char** argv) {
   // synchronously, in a loop, so we don't need to set up an asynchronous
   // event handler like we do in most of the other test programs.)
   unsigned packetSize;
-  struct sockaddr_in fromAddress;
+  struct sockaddr_storage fromAddress;
   while (inputGroupsock.handleRead(packet, maxPacketSize,
 				   packetSize, fromAddress)) {
     printf("\n[packet from %s (%d bytes)]\n", AddressString(fromAddress).val(), packetSize);
@@ -66,7 +67,7 @@ int main(int argc, char** argv) {
     }
 
     packet[packetSize] = '\0'; // just in case
-    printf((char*)(packet+8));
+    printf("%s", (char*)(packet+8));
   }
 
   return 0; // only to prevent compiler warning

@@ -1,7 +1,7 @@
 /**********
 This library is free software; you can redistribute it and/or modify it under
 the terms of the GNU Lesser General Public License as published by the
-Free Software Foundation; either version 2.1 of the License, or (at your
+Free Software Foundation; either version 3 of the License, or (at your
 option) any later version. (See <http://www.gnu.org/copyleft/lesser.html>.)
 
 This library is distributed in the hope that it will be useful, but WITHOUT
@@ -14,7 +14,7 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 **********/
 // "liveMedia"
-// Copyright (c) 1996-2012 Live Networks, Inc.  All rights reserved.
+// Copyright (c) 1996-2026 Live Networks, Inc.  All rights reserved.
 // A sink that generates an AVI file from a composite media session
 // Implementation
 
@@ -24,6 +24,11 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 #include "GroupsockHelper.hh"
 
 #define fourChar(x,y,z,w) ( ((w)<<24)|((z)<<16)|((y)<<8)|(x) )/*little-endian*/
+
+#define AVIIF_LIST		0x00000001
+#define AVIIF_KEYFRAME		0x00000010
+#define AVIIF_NO_TIME		0x00000100
+#define AVIIF_COMPRESSOR	0x0FFF0000
 
 ////////// AVISubsessionIOState ///////////
 // A structure used to represent the I/O state of each input 'subsession':
@@ -95,6 +100,29 @@ private:
 };
 
 
+///////// AVIIndexRecord definition & implementation //////////
+
+class AVIIndexRecord {
+public:
+  AVIIndexRecord(unsigned chunkId, unsigned flags, unsigned offset, unsigned size)
+    : fNext(NULL), fChunkId(chunkId), fFlags(flags), fOffset(offset), fSize(size) {
+  }
+
+  AVIIndexRecord*& next() { return fNext; }
+  unsigned chunkId() const { return fChunkId; }
+  unsigned flags() const { return fFlags; }
+  unsigned offset() const { return fOffset; }
+  unsigned size() const { return fSize; }
+
+private:
+  AVIIndexRecord* fNext;
+  unsigned fChunkId;
+  unsigned fFlags;
+  unsigned fOffset;
+  unsigned fSize;
+};
+
+
 ////////// AVIFileSink implementation //////////
 
 AVIFileSink::AVIFileSink(UsageEnvironment& env,
@@ -104,6 +132,7 @@ AVIFileSink::AVIFileSink(UsageEnvironment& env,
 			 unsigned short movieWidth, unsigned short movieHeight,
 			 unsigned movieFPS, Boolean packetLossCompensate)
   : Medium(env), fInputSession(inputSession),
+    fIndexRecordsHead(NULL), fIndexRecordsTail(NULL), fNumIndexRecords(0),
     fBufferSize(bufferSize), fPacketLossCompensate(packetLossCompensate),
     fAreCurrentlyBeingPlayed(False), fNumSubsessions(0), fNumBytesWritten(0),
     fHaveCompletedOutputFile(False),
@@ -150,15 +179,25 @@ AVIFileSink::AVIFileSink(UsageEnvironment& env,
 AVIFileSink::~AVIFileSink() {
   completeOutputFile();
 
-  // Then, delete each active "AVISubsessionIOState":
+  // Then, stop streaming and delete each active "AVISubsessionIOState":
   MediaSubsessionIterator iter(fInputSession);
   MediaSubsession* subsession;
   while ((subsession = iter.next()) != NULL) {
+    if (subsession->readSource() != NULL) subsession->readSource()->stopGettingFrames();
+
     AVISubsessionIOState* ioState
       = (AVISubsessionIOState*)(subsession->miscPtr);
     if (ioState == NULL) continue;
 
     delete ioState;
+  }
+
+  // Then, delete the index records:
+  AVIIndexRecord* cur = fIndexRecordsHead;
+  while (cur != NULL) {
+    AVIIndexRecord* next = cur->next();
+    delete cur;
+    cur = next;
   }
 
   // Finally, close our output file:
@@ -287,6 +326,16 @@ void AVIFileSink::onRTCPBye(void* clientData) {
   ioState->onSourceClosure();
 }
 
+void AVIFileSink::addIndexRecord(AVIIndexRecord* newIndexRecord) {
+  if (fIndexRecordsHead == NULL) {
+    fIndexRecordsHead = newIndexRecord;
+  } else {
+    fIndexRecordsTail->next() = newIndexRecord;
+  }
+  fIndexRecordsTail = newIndexRecord;
+  ++fNumIndexRecords;
+}
+
 void AVIFileSink::completeOutputFile() {
   if (fHaveCompletedOutputFile || fOutFid == NULL) return;
 
@@ -312,7 +361,16 @@ void AVIFileSink::completeOutputFile() {
   }
 
   //// Global fields:
-  fRIFFSizeValue += fNumBytesWritten;
+  add4ByteString("idx1");
+  addWord(fNumIndexRecords*4*4); // the size of all of the index records, which come next:
+  for (AVIIndexRecord* indexRecord = fIndexRecordsHead; indexRecord != NULL; indexRecord = indexRecord->next()) {
+    addWord(indexRecord->chunkId());
+    addWord(indexRecord->flags());
+    addWord(indexRecord->offset());
+    addWord(indexRecord->size());
+  }
+
+  fRIFFSizeValue += fNumBytesWritten + fNumIndexRecords*4*4 - 4;
   setWord(fRIFFSizePosition, fRIFFSizeValue);
 
   setWord(fAVIHMaxBytesPerSecondPosition, maxBytesPerSecond);
@@ -474,6 +532,14 @@ void AVISubsessionIOState::useFrame(SubsessionBuffer& buffer) {
       frameSource[i+1] = tmp;
     }
   }
+
+  // Add an index record for this frame:
+  AVIIndexRecord* newIndexRecord
+    = new AVIIndexRecord(fAVISubsessionTag, // chunk id
+			 AVIIF_KEYFRAME, // flags
+			 4 + fOurSink.fNumBytesWritten, // offset (note: 4 == 'movi')
+			 frameSize); // size
+  fOurSink.addIndexRecord(newIndexRecord);
 
   // Write the data into the file:
   fOurSink.fNumBytesWritten += fOurSink.addWord(fAVISubsessionTag);

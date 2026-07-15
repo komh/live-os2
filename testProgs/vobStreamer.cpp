@@ -1,7 +1,7 @@
 /**********
 This library is free software; you can redistribute it and/or modify it under
 the terms of the GNU Lesser General Public License as published by the
-Free Software Foundation; either version 2.1 of the License, or (at your
+Free Software Foundation; either version 3 of the License, or (at your
 option) any later version. (See <http://www.gnu.org/copyleft/lesser.html>.)
 
 This library is distributed in the hope that it will be useful, but WITHOUT
@@ -13,15 +13,17 @@ You should have received a copy of the GNU Lesser General Public License
 along with this library; if not, write to the Free Software Foundation, Inc.,
 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 **********/
-// Copyright (c) 1996-2012, Live Networks, Inc.  All rights reserved
+// Copyright (c) 1996-2026, Live Networks, Inc.  All rights reserved
 // A test program that reads a VOB file
 // splits it into Audio (AC3) and Video (MPEG) Elementary Streams,
 // and streams both using RTP.
 // main program
 
 #include "liveMedia.hh"
+
 #include "AC3AudioStreamFramer.hh"
 #include "BasicUsageEnvironment.hh"
+#include "announceURL.hh"
 #include "GroupsockHelper.hh"
 
 char const* programName;
@@ -127,8 +129,12 @@ int main(int argc, char const** argv) {
   curInputFileName = inputFileNames;
 
   // Create 'groupsocks' for RTP and RTCP:
-  struct in_addr destinationAddress;
-  destinationAddress.s_addr = chooseRandomIPv4SSMAddress(*env);
+  struct sockaddr_storage destinationAddress;
+  destinationAddress.ss_family = AF_INET;
+  ((struct sockaddr_in&)destinationAddress).sin_addr.s_addr = chooseRandomIPv4SSMAddress(*env);
+  // Note: This is a multicast address.  If you wish instead to stream
+  // using unicast, then you should use the "testOnDemandRTSPServer"
+  // test program - not this test program - as a model.
 
   const unsigned short rtpPortNumAudio = 4444;
   const unsigned short rtcpPortNumAudio = rtpPortNumAudio+1;
@@ -205,11 +211,7 @@ int main(int argc, char const** argv) {
     rtspServer->addServerMediaSession(sms);
 
     *env << "Created RTSP server.\n";
-
-    // Display our "rtsp://" URL, for clients to connect to:
-    char* url = rtspServer->rtspURL(sms);
-    *env << "Access this stream using the URL:\n\t" << url << "\n";
-    delete[] url;
+    announceURL(rtspServer, sms);
   }
 
   // Finally, start the streaming:
@@ -225,8 +227,8 @@ void afterPlaying(void* clientData) {
   // One of the sinks has ended playing.
   // Check whether any of the sources have a pending read.  If so,
   // wait until its sink ends playing also:
-  if (audioSource != NULL && audioSource->isCurrentlyAwaitingData()
-      || videoSource != NULL && videoSource->isCurrentlyAwaitingData()) {
+  if ((audioSource != NULL && audioSource->isCurrentlyAwaitingData()) ||
+      (videoSource != NULL && videoSource->isCurrentlyAwaitingData())) {
     return;
   }
 
