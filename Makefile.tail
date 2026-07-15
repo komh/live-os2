@@ -25,7 +25,12 @@ all:
 	@echo
 	@echo "For more information about this source code (including your obligations under the LGPL), please see our FAQ at http://live555.com/liveMedia/faq.html"
 
-install:
+install-pc:
+	install -d $(DESTDIR)$(LIBDIR)/pkgconfig
+	sed -e 's,@PREFIX@,$(PREFIX),' -e 's,@VERSION@,$(VERSION),' live555.pc.in > live555.pc
+	install -m 644 live555.pc $(DESTDIR)$(LIBDIR)/pkgconfig/live555.pc
+
+install: install-pc
 	cd $(LIVEMEDIA_DIR) ; $(MAKE) install
 	cd $(GROUPSOCK_DIR) ; $(MAKE) install
 	cd $(USAGE_ENVIRONMENT_DIR) ; $(MAKE) install
@@ -44,6 +49,7 @@ clean:
 	cd $(MEDIA_SERVER_DIR) ; $(MAKE) clean
 	cd $(PROXY_SERVER_DIR) ; $(MAKE) clean
 	cd $(HLS_PROXY_DIR) ; $(MAKE) clean
+	-rm -f live555.pc
 
 distclean: clean
 	-rm -f $(LIVEMEDIA_DIR)/Makefile $(GROUPSOCK_DIR)/Makefile \
